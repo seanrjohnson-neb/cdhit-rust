@@ -1,0 +1,15 @@
+[package]
+name = "cdhit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for the Rust port of CD-HIT."
+
+[[bin]]
+name = "cdhit"
+path = "src/main.rs"
+
+[dependencies]
+cdhit-core = { path = "../cdhit-core" }
+flate2 = "1"

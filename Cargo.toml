@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cdhit-core",
+    "crates/cdhit-cli",
+]
+# cdhit-wasm and cdhit-testkit are added in later phases.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/seanrjohnson-neb/cdhit-rust"
+
+[profile.release]
+opt-level = 3
+lto = true

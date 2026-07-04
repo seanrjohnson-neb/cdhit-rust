@@ -1,0 +1,16 @@
+[package]
+name = "cdhit-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core engine for a Rust port of CD-HIT sequence clustering."
+
+[features]
+default = ["rayon", "gzip"]
+rayon = ["dep:rayon"]
+gzip = ["dep:flate2"]
+
+[dependencies]
+rayon = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }

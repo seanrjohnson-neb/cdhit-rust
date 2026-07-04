@@ -1,0 +1,20 @@
+>Cluster 0
+0	200nt, >seq_base... *
+1	200nt, >seq_mut5... at +/97.50%
+2	200nt, >seq_mut15... at +/96.50%
+3	200nt, >seq_rc... at -/99.00%
+>Cluster 1
+0	196nt, >rand1... *
+>Cluster 2
+0	192nt, >rand0... *
+>Cluster 3
+0	180nt, >seq2_base... *
+1	180nt, >seq2_mut8... at +/96.11%
+>Cluster 4
+0	174nt, >rand2... *
+>Cluster 5
+0	173nt, >rand5... *
+>Cluster 6
+0	164nt, >rand4... *
+>Cluster 7
+0	162nt, >rand3... *

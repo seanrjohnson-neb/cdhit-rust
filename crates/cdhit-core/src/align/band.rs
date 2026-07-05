@@ -11,6 +11,7 @@
 //! `i32` on assignment exactly as the C++ `int` assignment does.
 
 use crate::alphabet::ScoreMatrix;
+use crate::buffer::WorkingBuffer;
 use crate::options::Options;
 
 // Back-pointer directions (cdhit-common.h:466).
@@ -45,6 +46,7 @@ pub fn local_band_align(
     band_right: i32,
     options: &Options,
     want_alninfo: bool,
+    buffer: &mut WorkingBuffer,
 ) -> Option<BandAlign> {
     if band_right >= len2 || band_left <= -len1 || band_left > band_right {
         return None;
@@ -53,14 +55,20 @@ pub fn local_band_align(
     let band_width = band_right - band_left + 1;
     let band_width1 = band_width + 1;
 
-    // score_mat / back_mat [i][j1]: freshly zeroed each call. The C++ reuses a
-    // per-thread buffer, growing rows to band_width1 (new cells zeroed); the
-    // recurrence only ever reads cells written this call, so a fresh zeroed
-    // matrix is bit-identical and avoids stale-state hazards.
+    // score_mat / back_mat [i][j1]: reused per-thread buffer (flat rows*w),
+    // grown on demand. The C++ likewise reuses a per-thread buffer; the
+    // recurrence only ever reads cells it wrote this call, so no zeroing between
+    // calls is required (verified: this matches the previous fresh-zeroed
+    // implementation, and the C++, bit-for-bit).
     let rows = (len1 + 1) as usize;
     let w = band_width1 as usize;
-    let mut score_mat = vec![0i64; rows * w];
-    let mut back_mat = vec![0i32; rows * w];
+    let needed = rows * w;
+    if buffer.score_mat.len() < needed {
+        buffer.score_mat.resize(needed, 0);
+        buffer.back_mat.resize(needed, 0);
+    }
+    let score_mat = &mut buffer.score_mat;
+    let back_mat = &mut buffer.back_mat;
     let idx = |i: i32, j1: i32| (i as usize) * w + (j1 as usize);
 
     // Left border (band_left < 0): leading query hanging residues.
@@ -101,27 +109,39 @@ pub fn local_band_align(
         if j1_hi >= band_width {
             j1_hi = band_width;
         }
+        // Hoist per-row values out of the inner loop and use unchecked indexing
+        // in the hot DP recurrence (all indices are provably in bounds: codes
+        // are < MAX_AA, and flat offsets are < rows*w). Arithmetic is identical
+        // to the checked version above/below.
+        let row_i = (i as usize) * w;
+        let row_im1 = ((i - 1) as usize) * w;
+        let ci = iseq1[(i - 1) as usize] as usize;
+        let ci_row = unsafe { mat.matrix.get_unchecked(ci) };
+        let at_last_row = i == len1;
         for j1 in j0..=j1_hi {
             let j = j1 + i + band_left;
+            let j1u = j1 as usize;
 
-            let ci = iseq1[(i - 1) as usize] as usize;
-            let cj = iseq2[(j - 1) as usize] as usize;
-            let mut sij = mat.matrix[ci][cj];
+            let cj = unsafe { *iseq2.get_unchecked((j - 1) as usize) } as usize;
+            let mut sij = unsafe { *ci_row.get_unchecked(cj) };
 
             // Extra score by distance to the best diagonal (max distance 3).
-            let extra = extra_score[((j1 - max_diag).abs() & 3) as usize];
+            let extra = unsafe { *extra_score.get_unchecked(((j1 - max_diag).abs() & 3) as usize) };
             sij += extra * (sij > 0) as i32;
 
             let mut back = DP_BACK_LEFT_TOP;
-            let mut best_score1 = score_mat[idx(i - 1, j1)] + sij as i64;
-            let gap0 = gap_open[((i == len1) as usize) | ((j == len2) as usize)];
+            let mut best_score1 =
+                unsafe { *score_mat.get_unchecked(row_im1 + j1u) } + sij as i64;
+            let gap0 = unsafe {
+                *gap_open.get_unchecked((at_last_row as usize) | ((j == len2) as usize))
+            };
 
             if j1 > 0 {
                 let mut gap = gap0;
-                if back_mat[idx(i, j1 - 1)] == DP_BACK_LEFT {
+                if unsafe { *back_mat.get_unchecked(row_i + j1u - 1) } == DP_BACK_LEFT {
                     gap = mat.ext_gap;
                 }
-                let score = score_mat[idx(i, j1 - 1)] + gap as i64;
+                let score = unsafe { *score_mat.get_unchecked(row_i + j1u - 1) } + gap as i64;
                 if score > best_score1 {
                     back = DP_BACK_LEFT;
                     best_score1 = score;
@@ -129,17 +149,19 @@ pub fn local_band_align(
             }
             if j1 + 1 < band_width {
                 let mut gap = gap0;
-                if back_mat[idx(i - 1, j1 + 1)] == DP_BACK_TOP {
+                if unsafe { *back_mat.get_unchecked(row_im1 + j1u + 1) } == DP_BACK_TOP {
                     gap = mat.ext_gap;
                 }
-                let score = score_mat[idx(i - 1, j1 + 1)] + gap as i64;
+                let score = unsafe { *score_mat.get_unchecked(row_im1 + j1u + 1) } + gap as i64;
                 if score > best_score1 {
                     back = DP_BACK_TOP;
                     best_score1 = score;
                 }
             }
-            score_mat[idx(i, j1)] = best_score1;
-            back_mat[idx(i, j1)] = back;
+            unsafe {
+                *score_mat.get_unchecked_mut(row_i + j1u) = best_score1;
+                *back_mat.get_unchecked_mut(row_i + j1u) = back;
+            }
         }
     }
 

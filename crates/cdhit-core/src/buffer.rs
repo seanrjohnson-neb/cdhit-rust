@@ -25,6 +25,12 @@ pub struct WorkingBuffer {
     pub diag_score2: Vec<i32>,
     pub aan_list_comp: Vec<i32>,
     pub seqi_comp: Vec<u8>,
+    /// Banded-DP score/back matrices, reused across `local_band_align` calls
+    /// (flat `rows * band_width1` layout) so the hot alignment path allocates
+    /// nothing. Grown on demand; contents need not be zeroed between calls
+    /// (the recurrence only reads cells it wrote this call).
+    pub score_mat: Vec<i64>,
+    pub back_mat: Vec<i32>,
 }
 
 impl WorkingBuffer {
@@ -41,6 +47,13 @@ impl WorkingBuffer {
         if frag > crate::seqdb::MAX_TABLE_SEQ {
             frag = crate::seqdb::MAX_TABLE_SEQ;
         }
+        // Diagonal arrays need only cover the longest possible alignment
+        // (nall = len1 + len2 - 1 <= 2*max_len - 1). The C++ over-allocates to
+        // MAX_DIAG = 2*MAX_SEQ and reuses one buffer per thread; we size to the
+        // actual data so per-task buffers stay cheap (important for the parallel
+        // path, which allocates a buffer per worker). `+2` leaves room for the
+        // out-of-band index used at the endpoints.
+        let diag = (2 * max_len + 2).max(2);
         WorkingBuffer {
             taap: vec![0; m],
             word_encodes: vec![0; max_len],
@@ -50,10 +63,12 @@ impl WorkingBuffer {
             aap_begin: vec![0; m],
             look_counts: vec![IndexCount::default(); frag + 2],
             index_mapping: vec![0; frag + 2],
-            diag_score: vec![0; MAX_DIAG],
-            diag_score2: vec![0; MAX_DIAG],
+            diag_score: vec![0; diag],
+            diag_score2: vec![0; diag],
             aan_list_comp: vec![0; max_len],
-            seqi_comp: vec![0; MAX_SEQ as usize],
+            seqi_comp: vec![0; max_len + 1],
+            score_mat: Vec::new(),
+            back_mat: Vec::new(),
         }
     }
 

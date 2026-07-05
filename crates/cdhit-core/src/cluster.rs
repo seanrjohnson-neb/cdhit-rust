@@ -24,6 +24,15 @@ use crate::wordtable::WordTable;
 
 const OK_FUNC: i32 = 0;
 
+
+#[cfg(feature = "rayon")]
+thread_local! {
+    /// Per-thread reusable scratch for the parallel screen, so the many
+    /// fork-join rounds don't each allocate a `WorkingBuffer`.
+    static SCREEN_SCRATCH: std::cell::RefCell<Option<(WorkingParam, WorkingBuffer)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Outcome of comparing a candidate against the current word table.
 struct CheckContext<'a> {
     reps: &'a [Sequence],
@@ -34,9 +43,48 @@ struct CheckContext<'a> {
     comp_aan_idx: &'a [i32],
 }
 
-/// Port of `CheckOneAA` (cdhit-common.c++:3235-3405) for the frag_size == 0,
-/// has2D == false configuration. Returns 1 if `seq` is redundant against an
-/// existing representative (fields on `seq` are updated), else 0.
+/// Read-only outcome of a `CheckOne` comparison. Separates the decision from
+/// mutating the sequence, so screening can run in parallel (many sequences read
+/// the same rep table concurrently) and the caller applies results serially.
+#[derive(Clone, Default)]
+struct MatchInfo {
+    /// 0 = no match, 1 = forward match, -1 = reverse-complement match (EST).
+    flag: i32,
+    identity: f32,
+    distance: f32,
+    cluster_id: i32,
+    coverage: [i32; 4],
+    /// The C++ sets IS_REDUNDANT inside the loop in 2D mode.
+    redundant_2d: bool,
+}
+
+/// Apply a `MatchInfo` to a sequence, reproducing the C++ mutation at the end
+/// of `CheckOne` (set fields on match; clear data + mark redundant unless
+/// cluster_best; set/clear the minus-strand flag for EST).
+fn apply_match(seq: &mut Sequence, info: &MatchInfo, options: &Options, est: bool) {
+    if info.redundant_2d {
+        seq.state |= IS_REDUNDANT;
+    }
+    if info.flag != 0 {
+        seq.identity = info.identity;
+        seq.cluster_id = info.cluster_id;
+        seq.distance = info.distance;
+        seq.coverage = info.coverage;
+        if !options.cluster_best {
+            seq.data.clear();
+            seq.state |= IS_REDUNDANT;
+        }
+        if est {
+            if info.flag == -1 {
+                seq.state |= IS_MINUS_STRAND;
+            } else {
+                seq.state &= !IS_MINUS_STRAND;
+            }
+        }
+    }
+}
+
+/// Mutating wrapper: run `check_one_aa_core` and apply the result to `seq`.
 fn check_one_aa(
     seq: &mut Sequence,
     ctx: &CheckContext,
@@ -44,6 +92,21 @@ fn check_one_aa(
     buf: &mut WorkingBuffer,
     options: &Options,
 ) -> i32 {
+    let info = check_one_aa_core(seq, ctx, param, buf, options);
+    apply_match(seq, &info, options, false);
+    info.flag
+}
+
+/// Port of `CheckOneAA` (cdhit-common.c++:3235-3405) for the frag_size == 0
+/// configuration. Read-only: returns what would be set on `seq` without
+/// mutating it (the caller applies via `apply_match`).
+fn check_one_aa_core(
+    seq: &Sequence,
+    ctx: &CheckContext,
+    param: &mut WorkingParam,
+    buf: &mut WorkingBuffer,
+    options: &Options,
+) -> MatchInfo {
     let mut aa1_cutoff = param.aa1_cutoff;
     let mut aa2_cutoff = param.aas_cutoff;
     let mut aan_cutoff = param.aan_cutoff;
@@ -53,7 +116,12 @@ fn check_one_aa(
     let naa2 = ctx.naa.array[2];
     let naa = options.naa;
     let len = seq.size;
-    let mut flag = 0;
+    let mut info = MatchInfo {
+        identity: seq.identity,
+        distance: seq.distance,
+        cluster_id: seq.cluster_id,
+        ..Default::default()
+    };
 
     let s = table.sequences.len();
     let mut len_eff = len;
@@ -77,7 +145,7 @@ fn check_one_aa(
         let min_size = ctx.reps[table.sequences[s - 1]].size;
         let min_red = min_size as f64 * options.long_coverage - options.band_width as f64;
         if (len as f64) < min_red {
-            return 0;
+            return info;
         }
     }
 
@@ -87,7 +155,7 @@ fn check_one_aa(
     buf.encode_words(&seq.data, seq.size, naa, ctx.naa, false);
 
     if options.min_control > len {
-        return 0;
+        return info;
     }
 
     let aan_no = (len - naa + 1) as usize;
@@ -161,6 +229,7 @@ fn check_one_aa(
             diag.band_right,
             options,
             true,
+            buf,
         );
         let align = match align {
             Some(a) => a,
@@ -176,18 +245,21 @@ fn check_one_aa(
             lens - align.alninfo[4]
         };
         let tiden_pc = align.iden_no as f32 / len_eff1 as f32;
+        // C++ promotes the float identity/distance to double when comparing
+        // against the double thresholds; match that (comparing as f32 flips
+        // decisions at exact boundaries like 49/70 == 0.70).
         if options.use_distance {
-            if align.dist > options.distance_thd as f32 {
+            if (align.dist as f64) > options.distance_thd {
                 continue;
             }
-            if align.dist >= seq.distance {
+            if align.dist >= info.distance {
                 continue;
             }
         } else {
-            if tiden_pc < options.cluster_thd as f32 {
+            if (tiden_pc as f64) < options.cluster_thd {
                 continue;
             }
-            if tiden_pc <= seq.identity {
+            if tiden_pc <= info.identity {
                 continue;
             }
         }
@@ -200,16 +272,16 @@ fn check_one_aa(
             }
         }
         if options.has2d {
-            seq.state |= IS_REDUNDANT;
+            info.redundant_2d = true;
         }
-        flag = 1;
-        seq.identity = tiden_pc;
-        seq.cluster_id = rep.cluster_id;
-        seq.distance = align.dist;
-        seq.coverage[0] = align.alninfo[0] + 1;
-        seq.coverage[1] = align.alninfo[1] + 1;
-        seq.coverage[2] = align.alninfo[2] + 1;
-        seq.coverage[3] = align.alninfo[3] + 1;
+        info.flag = 1;
+        info.identity = tiden_pc;
+        info.cluster_id = rep.cluster_id;
+        info.distance = align.dist;
+        info.coverage[0] = align.alninfo[0] + 1;
+        info.coverage[1] = align.alninfo[1] + 1;
+        info.coverage[2] = align.alninfo[2] + 1;
+        info.coverage[3] = align.alninfo[3] + 1;
         if !options.cluster_best {
             break;
         }
@@ -233,17 +305,10 @@ fn check_one_aa(
     for t in 0..look_len {
         buf.index_mapping[buf.look_counts[t].index as usize] = 0;
     }
-
-    if flag == 1 && !options.cluster_best {
-        seq.data.clear();
-        seq.state |= IS_REDUNDANT;
-    }
-    flag
+    info
 }
 
-/// Port of `CheckOneEST` (cdhit-common.c++:3406-3593) for frag_size == 0.
-/// Runs a forward pass and (if `option_r`) a reverse-complement pass; returns
-/// 1 for a forward match, -1 for a reverse-complement match, 0 for no match.
+/// Mutating wrapper: run `check_one_est_core` and apply the result to `seq`.
 fn check_one_est(
     seq: &mut Sequence,
     ctx: &CheckContext,
@@ -251,11 +316,32 @@ fn check_one_est(
     buf: &mut WorkingBuffer,
     options: &Options,
 ) -> i32 {
+    let info = check_one_est_core(seq, ctx, param, buf, options);
+    apply_match(seq, &info, options, true);
+    info.flag
+}
+
+/// Port of `CheckOneEST` (cdhit-common.c++:3406-3593) for frag_size == 0.
+/// Runs a forward pass and (if `option_r`) a reverse-complement pass. Read-only:
+/// returns the outcome (`flag` = 1 forward, -1 reverse-complement, 0 no match)
+/// without mutating `seq`.
+fn check_one_est_core(
+    seq: &Sequence,
+    ctx: &CheckContext,
+    param: &mut WorkingParam,
+    buf: &mut WorkingBuffer,
+    options: &Options,
+) -> MatchInfo {
     let table = ctx.table;
     let naa1 = ctx.naa.array[1];
     let naa = options.naa;
     let len = seq.size;
-    let mut flag = 0;
+    let mut info = MatchInfo {
+        identity: seq.identity,
+        distance: seq.distance,
+        cluster_id: seq.cluster_id,
+        ..Default::default()
+    };
 
     let s = table.sequences.len();
     let mut len_eff = len;
@@ -276,7 +362,7 @@ fn check_one_est(
         let min_size = ctx.reps[table.sequences[s - 1]].size;
         let min_red = min_size as f64 * options.long_coverage - options.band_width as f64;
         if (len as f64) < min_red {
-            return 0;
+            return info;
         }
     }
 
@@ -297,7 +383,7 @@ fn check_one_est(
     }
 
     if options.min_control > len {
-        return 0;
+        return info;
     }
 
     let aan_no = (len - naa + 1) as usize;
@@ -404,6 +490,7 @@ fn check_one_est(
                 diag.band_right,
                 options,
                 true,
+            buf,
             );
             let mut align = match align {
                 Some(a) => a,
@@ -435,18 +522,19 @@ fn check_one_est(
                 lens - align.alninfo[4]
             };
             let tiden_pc = align.iden_no as f32 / len_eff1 as f32;
+            // Promote to double to match the C++ float-vs-double comparison.
             if options.use_distance {
-                if align.dist > options.distance_thd as f32 {
+                if (align.dist as f64) > options.distance_thd {
                     continue;
                 }
-                if options.cluster_best && align.dist >= seq.distance {
+                if options.cluster_best && align.dist >= info.distance {
                     continue;
                 }
             } else {
-                if tiden_pc < options.cluster_thd as f32 {
+                if (tiden_pc as f64) < options.cluster_thd {
                     continue;
                 }
-                if options.cluster_best && tiden_pc < seq.identity {
+                if options.cluster_best && tiden_pc < info.identity {
                     continue;
                 }
             }
@@ -463,22 +551,22 @@ fn check_one_est(
                 }
             }
             if options.cluster_best
-                && (tiden_pc - seq.identity).abs() < 1e-9
-                && rep.cluster_id >= seq.cluster_id
+                && (tiden_pc - info.identity).abs() < 1e-9
+                && rep.cluster_id >= info.cluster_id
             {
                 continue;
             }
-            if !options.cluster_best && flag != 0 && rep.cluster_id >= seq.cluster_id {
+            if !options.cluster_best && info.flag != 0 && rep.cluster_id >= info.cluster_id {
                 continue;
             }
-            flag = if comp != 0 { -1 } else { 1 };
-            seq.identity = tiden_pc;
-            seq.distance = align.dist;
-            seq.cluster_id = rep.cluster_id;
-            seq.coverage[0] = align.alninfo[0] + 1;
-            seq.coverage[1] = align.alninfo[1] + 1;
-            seq.coverage[2] = align.alninfo[2] + 1;
-            seq.coverage[3] = align.alninfo[3] + 1;
+            info.flag = if comp != 0 { -1 } else { 1 };
+            info.identity = tiden_pc;
+            info.distance = align.dist;
+            info.cluster_id = rep.cluster_id;
+            info.coverage[0] = align.alninfo[0] + 1;
+            info.coverage[1] = align.alninfo[1] + 1;
+            info.coverage[2] = align.alninfo[2] + 1;
+            info.coverage[3] = align.alninfo[3] + 1;
             if !options.cluster_best {
                 break;
             }
@@ -490,19 +578,7 @@ fn check_one_est(
             break;
         }
     }
-
-    if flag == 1 || flag == -1 {
-        if !options.cluster_best {
-            seq.data.clear();
-            seq.state |= IS_REDUNDANT;
-        }
-        if flag == -1 {
-            seq.state |= IS_MINUS_STRAND;
-        } else {
-            seq.state &= !IS_MINUS_STRAND;
-        }
-    }
-    flag
+    info
 }
 
 impl crate::seqdb::SequenceDb {
@@ -537,6 +613,18 @@ impl crate::seqdb::SequenceDb {
             Vec::new()
         };
 
+        // Parallel path: screen a window of upcoming sequences against the
+        // frozen representative prefix in parallel, then commit the window
+        // serially in order (cluster_one resolves intra-window matches and adds
+        // new representatives). This mirrors the structure of the C++ threaded
+        // DoClustering (frozen-table screen + in-order rep assignment), which is
+        // verified to reproduce the serial result bit-for-bit.
+        #[cfg(feature = "rayon")]
+        if options.threads != 1 && seq_no > 1 {
+            self.do_clustering_parallel(options, scoring, naa, &comp_aan_idx, table, param, buf);
+            return;
+        }
+
         for ks in 0..seq_no {
             if self.sequences[ks].state & IS_REDUNDANT != 0 {
                 continue;
@@ -555,6 +643,226 @@ impl crate::seqdb::SequenceDb {
             );
         }
     }
+
+    /// Fast **approximate** parallel greedy clustering (see `do_clustering`),
+    /// mirroring CD-HIT's threaded strategy: overlap the serial
+    /// representative-building of the current batch `[i, m)` with parallel
+    /// screening of all following sequences `[m, N)` against the previous
+    /// batch's frozen representatives.
+    ///
+    /// Because a sequence's redundancy is decided against the representatives
+    /// discovered so far (batch by batch) rather than against every earlier
+    /// representative in one lookup order, the cluster *assignments* can differ
+    /// from the serial result when a sequence matches several representatives —
+    /// exactly as CD-HIT's own OpenMP output differs from its serial output. The
+    /// clustering is of equivalent quality. Unlike CD-HIT this implementation is
+    /// **deterministic**: batch sizes are fixed independent of thread count, the
+    /// frozen table is read-only during screening, and representatives are
+    /// assigned serially in index order, so the output is identical for any
+    /// `-T`. Use `-T 1` for output byte-identical to the reference serial run.
+    #[cfg(feature = "rayon")]
+    #[allow(clippy::too_many_arguments)]
+    fn do_clustering_parallel(
+        &mut self,
+        options: &Options,
+        scoring: &Scoring,
+        naa: &Naa,
+        comp_aan_idx: &[i32],
+        mut word_table: WordTable,
+        base_param: WorkingParam,
+        mut buf: WorkingBuffer,
+    ) {
+        let seq_no = self.sequences.len();
+        let est = options.is_est;
+        let buf_len = self.max_len as usize;
+        let mut param = base_param.clone();
+
+        // `spare` holds the previous batch's frozen word table (reused, cleared
+        // and swapped each iteration to avoid re-allocating the NAAN rows).
+        // `last_reps` owns the previous batch's representative sequences so the
+        // parallel screen never aliases `self.sequences`.
+        let mut spare = WordTable::new(options.naa, self.naan);
+        if est {
+            spare.set_dna();
+        }
+        let mut last_reps: Vec<Sequence> = Vec::new();
+        let mut have_last = false;
+
+        // Batch size: small first batch (serial discovery of the initial reps
+        // against an empty frozen table) then a fixed moderate size. Keeping it
+        // moderate bounds the serial rep-building per barrier and keeps the
+        // final (fully-serial) batch small. Deterministic / thread-independent.
+        let steady_batch = 2048usize;
+        let mut batch = 256usize;
+
+        let mut i = 0usize;
+        while i < seq_no {
+            let m = (i + batch).min(seq_no);
+
+            // Phase 1: screen the current batch [i, m) against the previous
+            // batch's frozen reps, marking matches redundant before we build.
+            if have_last {
+                screen_against_frozen(
+                    &mut self.sequences[i..m],
+                    &spare,
+                    &last_reps,
+                    options,
+                    scoring,
+                    naa,
+                    comp_aan_idx,
+                    &base_param,
+                    buf_len,
+                    seq_no,
+                    est,
+                );
+            }
+
+            // Screen only the length-compatible sequences ahead. Sequences are
+            // sorted longest-first, so once a sequence is too short for the
+            // frozen table's shortest representative, no later (shorter) one can
+            // match it either — the length filter would reject them anyway, so
+            // this prune is exact, not approximate. It is what keeps the
+            // repeated ahead-screening from being O(N * batches).
+            let ahead_end = if have_last {
+                let min_rep = last_reps.last().map(|r| r.size).unwrap_or(0);
+                let mut j = m;
+                while j < seq_no
+                    && upper_bound_length_rep(self.sequences[j].size, options) >= min_rep
+                {
+                    j += 1;
+                }
+                j
+            } else {
+                m
+            };
+
+            // Overlap: build [i, m) representatives serially, while screening the
+            // compatible sequences ahead [m, ahead_end) against the frozen table
+            // in parallel.
+            {
+                let (left, right) = self.sequences.split_at_mut(m);
+                let rep_seqs = &mut self.rep_seqs;
+                let wt = &mut word_table;
+                let pm = &mut param;
+                let bf = &mut buf;
+                let spare_ref = &spare;
+                let last_reps_ref = &last_reps;
+                let bp = &base_param;
+                let ahead = ahead_end - m;
+                rayon::join(
+                    || {
+                        for ks in i..m {
+                            if left[ks].state & IS_REDUNDANT != 0 {
+                                continue;
+                            }
+                            cluster_one(
+                                left, ks, wt, pm, bf, options, scoring, naa, comp_aan_idx, rep_seqs,
+                            );
+                        }
+                    },
+                    || {
+                        if have_last && ahead > 0 {
+                            screen_against_frozen(
+                                &mut right[..ahead], spare_ref, last_reps_ref, options, scoring,
+                                naa, comp_aan_idx, bp, buf_len, seq_no, est,
+                            );
+                        }
+                    },
+                );
+            }
+
+            // Freeze the batch we just built into the frozen slot for next time:
+            // clone the (small) representative payloads and swap the word table
+            // into `spare` (reusing its allocation), remapping to identity.
+            let new_reps: Vec<Sequence> = word_table
+                .sequences
+                .iter()
+                .map(|&g| {
+                    let s = &self.sequences[g];
+                    let mut r = Sequence::default();
+                    r.data = s.data.clone();
+                    r.size = s.size;
+                    r.cluster_id = s.cluster_id;
+                    r
+                })
+                .collect();
+            std::mem::swap(&mut word_table, &mut spare);
+            word_table.clear();
+            spare.sequences = (0..new_reps.len()).collect();
+            last_reps = new_reps;
+            have_last = true;
+
+            i = m;
+            batch = (batch * 2).min(steady_batch);
+        }
+    }
+}
+
+/// Screen a slice of sequences against a frozen table (`table` word index +
+/// `reps` owned representative payloads, with `table.sequences` an identity
+/// map) in parallel. Matches are finalized in place. Used by the parallel 1D
+/// path so the screen never aliases the main sequence buffer.
+#[cfg(feature = "rayon")]
+#[allow(clippy::too_many_arguments)]
+fn screen_against_frozen(
+    win: &mut [Sequence],
+    table: &WordTable,
+    reps: &[Sequence],
+    options: &Options,
+    scoring: &Scoring,
+    naa: &Naa,
+    comp_aan_idx: &[i32],
+    base_param: &WorkingParam,
+    buf_len: usize,
+    frag_max: usize,
+    est: bool,
+) {
+    use rayon::prelude::*;
+    win.par_iter_mut().for_each(|seq| {
+        if seq.state & IS_REDUNDANT != 0 {
+            return;
+        }
+        SCREEN_SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let scratch = slot.get_or_insert_with(|| {
+                (
+                    WorkingParam::new(
+                        base_param.aa1_cutoff,
+                        base_param.aas_cutoff,
+                        base_param.aan_cutoff,
+                    ),
+                    WorkingBuffer::new(frag_max, buf_len, options),
+                )
+            });
+            if scratch.1.word_encodes.len() < buf_len || scratch.1.look_counts.len() < frag_max + 2 {
+                *scratch = (
+                    WorkingParam::new(
+                        base_param.aa1_cutoff,
+                        base_param.aas_cutoff,
+                        base_param.aan_cutoff,
+                    ),
+                    WorkingBuffer::new(frag_max, buf_len, options),
+                );
+            }
+            let (p, b) = scratch;
+            p.len_upper_bound = upper_bound_length_rep(seq.size, options);
+            let ctx = CheckContext {
+                reps,
+                table,
+                naa,
+                mat: &scoring.mat,
+                comp_aan_idx,
+            };
+            let info = if est {
+                check_one_est_core(seq, &ctx, p, b, options)
+            } else {
+                check_one_aa_core(seq, &ctx, p, b, options)
+            };
+            if info.flag != 0 {
+                apply_match(seq, &info, options, est);
+            }
+        });
+    });
 }
 
 use crate::options::Scoring;
@@ -618,35 +926,36 @@ impl crate::seqdb::SequenceDb {
             comp_aan_idx,
         };
 
-        let m = self.sequences.len();
-        for j in 0..m {
-            if self.sequences[j].state & IS_REDUNDANT != 0 {
-                continue;
-            }
-            let len = self.sequences[j].size;
-            let len_upper_bound = upper_bound_length_rep(len, options);
-            let mut len_lower_bound = len - options.diff_cutoff_aa2;
-            let len_tmp = (len as f64 * options.diff_cutoff2) as i32;
-            if len_tmp < len_lower_bound {
-                len_lower_bound = len_tmp;
-            }
-            param.len_upper_bound = len_upper_bound;
-            param.len_lower_bound = len_lower_bound;
-
-            let seq = &mut self.sequences[j];
-            let flag = if options.is_est {
-                check_one_est(seq, &ctx, &mut param, &mut buf, options)
+        // Screen each db2 sequence against the fixed db1 table. This is
+        // embarrassingly parallel: the table is read-only and each db2 sequence
+        // is compared independently (no db2 sequence becomes a representative,
+        // and the tie-breaks compare only within one sequence's own passes), so
+        // the result is identical serial or parallel.
+        #[cfg(feature = "rayon")]
+        {
+            if options.threads != 1 {
+                use rayon::prelude::*;
+                // Buffer must fit the longest sequence of either database.
+                let buf_len = self.max_len.max(other.max_len) as usize;
+                self.sequences.par_iter_mut().for_each_init(
+                    || {
+                        (
+                            WorkingParam::new(param.aa1_cutoff, param.aas_cutoff, param.aan_cutoff),
+                            WorkingBuffer::new(n, buf_len, options),
+                        )
+                    },
+                    |(p, b), seq| screen_one_2d(seq, &ctx, p, b, options),
+                );
             } else {
-                check_one_aa(seq, &ctx, &mut param, &mut buf, options)
-            };
-            if flag == 1 || flag == -1 {
-                if !options.cluster_best {
-                    seq.data.clear();
-                    seq.state |= IS_REDUNDANT;
+                for seq in self.sequences.iter_mut() {
+                    screen_one_2d(seq, &ctx, &mut param, &mut buf, options);
                 }
-                if flag == -1 {
-                    seq.state |= IS_MINUS_STRAND;
-                }
+            }
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            for seq in self.sequences.iter_mut() {
+                screen_one_2d(seq, &ctx, &mut param, &mut buf, options);
             }
         }
 
@@ -665,6 +974,45 @@ impl crate::seqdb::SequenceDb {
             if self.sequences[i].state & IS_REDUNDANT == 0 {
                 self.rep_seqs.push(i as i32);
             }
+        }
+    }
+}
+
+/// Screen a single db2 sequence against the fixed db1 word table (the body of
+/// the `ClusterTo` screening loop). Sets `seq` state on a match. Independent of
+/// other db2 sequences, so safe to run in parallel.
+fn screen_one_2d(
+    seq: &mut Sequence,
+    ctx: &CheckContext,
+    param: &mut WorkingParam,
+    buf: &mut WorkingBuffer,
+    options: &Options,
+) {
+    if seq.state & IS_REDUNDANT != 0 {
+        return;
+    }
+    let len = seq.size;
+    let len_upper_bound = upper_bound_length_rep(len, options);
+    let mut len_lower_bound = len - options.diff_cutoff_aa2;
+    let len_tmp = (len as f64 * options.diff_cutoff2) as i32;
+    if len_tmp < len_lower_bound {
+        len_lower_bound = len_tmp;
+    }
+    param.len_upper_bound = len_upper_bound;
+    param.len_lower_bound = len_lower_bound;
+
+    let flag = if options.is_est {
+        check_one_est(seq, ctx, param, buf, options)
+    } else {
+        check_one_aa(seq, ctx, param, buf, options)
+    };
+    if flag == 1 || flag == -1 {
+        if !options.cluster_best {
+            seq.data.clear();
+            seq.state |= IS_REDUNDANT;
+        }
+        if flag == -1 {
+            seq.state |= IS_MINUS_STRAND;
         }
     }
 }

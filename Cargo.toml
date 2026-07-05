@@ -3,8 +3,8 @@ resolver = "2"
 members = [
     "crates/cdhit-core",
     "crates/cdhit-cli",
+    "crates/cdhit-wasm",
 ]
-# cdhit-wasm and cdhit-testkit are added in later phases.
 
 [workspace.package]
 version = "0.1.0"

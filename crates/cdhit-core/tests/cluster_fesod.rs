@@ -84,3 +84,19 @@ fn fesod_local_identity_coverage_matches_cpp() {
     .unwrap();
     assert_eq!(out.clstr, expected);
 }
+
+/// Regression for the float/double threshold-boundary bug found by fuzzing:
+/// an identity of exactly 70.00% (e.g. 49/70) must be rejected at -c 0.7,
+/// matching the C++ float-promoted-to-double comparison.
+#[test]
+fn identity_boundary_70pct_matches_cpp() {
+    let fa = include_bytes!("data/boundary70.fasta");
+    let expected = include_str!("data/boundary70_c0.7_n4.clstr");
+    let out = cluster_1d(
+        fa,
+        &args(&["-i", "x", "-o", "y", "-c", "0.7", "-n", "4"]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(out.clstr, expected);
+}

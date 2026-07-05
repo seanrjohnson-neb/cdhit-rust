@@ -146,32 +146,34 @@ impl WordTable {
             }
         }
 
+        // Hot loop: all indices are provably in bounds — `j` is a word encode
+        // (< NAAN = index_counts.len()), `ic.index` is a table-local rep index
+        // (< look_counts/index_mapping capacity), and `look_len` never exceeds
+        // that capacity. Use unchecked indexing to match the C++ pointer walk.
         while j0 < aan_no {
-            let j = word_encodes[j0];
-            let j1 = word_encodes_no[j0];
+            let j = unsafe { *word_encodes.get_unchecked(j0) };
+            let j1 = unsafe { *word_encodes_no.get_unchecked(j0) };
             if j1 == 0 {
                 j0 += 1;
                 continue;
             }
-            let row = &self.index_counts[j as usize];
+            let row = unsafe { self.index_counts.get_unchecked(j as usize) };
             let rest = aan_no as i32 - j0 as i32 + 1;
+            let j1i = j1 as i32;
             for ic in row {
-                let c = if ic.count < j1 as i32 {
-                    ic.count
-                } else {
-                    j1 as i32
-                };
-                let idm = &mut index_mapping[ic.index as usize];
+                let c = if ic.count < j1i { ic.count } else { j1i };
+                let idm = unsafe { index_mapping.get_unchecked_mut(ic.index as usize) };
                 if *idm == 0 {
                     if rest < min {
                         continue;
                     }
-                    look_counts[look_len].index = ic.index;
-                    look_counts[look_len].count = c;
+                    let slot = unsafe { look_counts.get_unchecked_mut(look_len) };
+                    slot.index = ic.index;
+                    slot.count = c;
                     look_len += 1;
                     *idm = look_len as u32;
                 } else {
-                    look_counts[(*idm - 1) as usize].count += c;
+                    unsafe { look_counts.get_unchecked_mut((*idm - 1) as usize) }.count += c;
                 }
             }
             j0 += 1;

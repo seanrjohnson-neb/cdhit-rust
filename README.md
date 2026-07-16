@@ -10,8 +10,9 @@ representative FASTA are byte-identical to the reference C++ (`make openmp=no`).
 
 ## Status
 
-All six clustering programs are implemented and verified byte-identical to the
-C++ across a large option matrix and randomized differential fuzzing:
+All six clustering programs plus the three `cd-hit-auxtools` programs are
+implemented and verified byte-identical to the C++ across an option matrix and
+differential testing:
 
 | Program | Description |
 |---|---|
@@ -21,10 +22,21 @@ C++ across a large option matrix and randomized differential fuzzing:
 | `cd-hit-est-2d` | Nucleotide 2D comparison |
 | `cd-hit-454` | 454 pyrosequencing duplicate detection |
 | `cd-hit-div` | Split a database into N segments |
+| `cd-hit-dup` | Duplicate / near-duplicate read detection (single-end + paired-end, chimera filtering) |
+| `cd-hit-lap` | Cluster reads that overlap end-to-end |
+| `read-linker` | Join paired-end reads by 3'/5' overlap |
 
-Not yet ported (out of scope for now): the `cd-hit-auxtools` package
-(`cd-hit-dup`, `cd-hit-lap`, `read-linker`), the Perl post-processing scripts,
-and `psi-cd-hit`.
+Not yet ported (out of scope for now): the Perl post-processing scripts and
+`psi-cd-hit`.
+
+The `cd-hit-auxtools` programs work on FASTA/FASTQ, share the `cdhit-core`
+crate, and — like the clustering programs — build for WebAssembly.
+
+> **Note on `cd-hit-dup -f`/`-s` (chimera filtering):** the reference C++
+> `DetectChimeric` contains out-of-bounds reads (undefined behaviour). The port
+> reproduces the well-defined behaviour bit-for-bit and guards the UB, so it
+> matches the reference on well-formed inputs; the de-duplication path is fully
+> verified.
 
 ## Workspace layout
 
@@ -42,6 +54,12 @@ cargo build --release
 ./target/release/cdhit cd-hit-est -i reads.fna -o output -c 0.95 -n 10
 ./target/release/cdhit cd-hit-2d  -i db1.faa -i2 db2.faa -o novel -c 0.9 -n 5
 ./target/release/cdhit cd-hit-div -i input.faa -o part -div 4
+
+# auxtools (own flags; run with no args for help)
+./target/release/cdhit cd-hit-dup  -i reads.fq -o uniq -e 1
+./target/release/cdhit cd-hit-dup  -i R1.fq -i2 R2.fq -o uniq -o2 uniq.R2
+./target/release/cdhit cd-hit-lap  -i reads.fa -o out -m 20
+./target/release/cdhit read-linker -1 R1.fq -2 R2.fq -o contigs.fq -l 10 -e 1
 ```
 
 Output is written to `<output>` (representatives) and `<output>.clstr`

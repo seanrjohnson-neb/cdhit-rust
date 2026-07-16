@@ -1,0 +1,4 @@
+>Cluster 0 chimeric_parent1=1,chimeric_parent2=0
+0	150nt, >CHIM_1... *
+1	150nt, >CHIM_0... at 1:150:1:150/+/100.00%
+2	150nt, >CHIM_2... at 1:150:1:150/+/100.00%

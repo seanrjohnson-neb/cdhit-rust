@@ -1,0 +1,44 @@
+>Cluster 0
+0	80nt, >g1_mm1_0... *
+>Cluster 1
+0	80nt, >g3_mm1_0... *
+>Cluster 2
+0	80nt, >g0_exact0... *
+1	80nt, >g0_exact1... at 1:80:1:80/+/100.00%
+>Cluster 3
+0	80nt, >g3_exact1... *
+1	80nt, >g3_exact0... at 1:80:1:80/+/100.00%
+>Cluster 4
+0	80nt, >g1_exact0... *
+1	80nt, >g1_exact2... at 1:80:1:80/+/100.00%
+2	80nt, >g1_exact1... at 1:80:1:80/+/100.00%
+>Cluster 5
+0	80nt, >g7_exact0... *
+1	80nt, >g7_exact2... at 1:80:1:80/+/100.00%
+2	80nt, >g7_exact1... at 1:80:1:80/+/100.00%
+>Cluster 6
+0	80nt, >g2_exact1... *
+1	80nt, >g2_exact0... at 1:80:1:80/+/100.00%
+>Cluster 7
+0	80nt, >g6_exact0... *
+1	80nt, >g6_exact2... at 1:80:1:80/+/100.00%
+2	80nt, >g6_exact1... at 1:80:1:80/+/100.00%
+3	80nt, >g6_exact3... at 1:80:1:80/+/100.00%
+>Cluster 8
+0	80nt, >g5_mm1_0... *
+>Cluster 9
+0	80nt, >g5_exact0... *
+>Cluster 10
+0	80nt, >g4_exact0... *
+>Cluster 11
+0	80nt, >g6_mm1_1... *
+>Cluster 12
+0	80nt, >g2_mm1_1... *
+>Cluster 13
+0	80nt, >g4_mm1_0... *
+>Cluster 14
+0	80nt, >g2_mm1_0... *
+>Cluster 15
+0	80nt, >g6_mm1_0... *
+>Cluster 16
+0	80nt, >g0_mm1_0... *

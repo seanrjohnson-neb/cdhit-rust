@@ -13,7 +13,10 @@
 //! console.log(res.clstr, res.rep_fasta, res.num_clusters);
 //! ```
 
-use cdhit_core::{cluster_1d_program, cluster_2d, Program};
+use cdhit_core::{
+    cd_hit_dup, cd_hit_lap, cluster_1d_program, cluster_2d, read_linker, DupParams, LapParams,
+    LinkerParams, Program,
+};
 use wasm_bindgen::prelude::*;
 
 /// Result of a clustering run, exposed to JavaScript.
@@ -87,5 +90,116 @@ pub fn cluster_2d_wasm(
         rep_fasta: String::from_utf8_lossy(&out.rep_fasta).into_owned(),
         clstr: out.clstr,
         num_clusters: out.num_clusters,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// cd-hit-auxtools bindings
+// ---------------------------------------------------------------------------
+
+/// Result of a `read-linker` run.
+#[wasm_bindgen(getter_with_clone)]
+pub struct LinkerResult {
+    /// Linked contigs (FASTA or FASTQ).
+    pub output: String,
+    /// Progress / summary text (what the CLI prints to stdout).
+    pub log: String,
+}
+
+/// Join paired-end reads by overlap (`read-linker`). `min` = minimum overlap
+/// (`-l`), `error` = max mismatches (`-e`).
+#[wasm_bindgen]
+pub fn link_reads(first: &str, second: &str, min: i32, error: i32) -> LinkerResult {
+    let out = read_linker(
+        first.as_bytes(),
+        second.as_bytes(),
+        &LinkerParams {
+            min,
+            error,
+            maxlen: 0,
+        },
+    );
+    LinkerResult {
+        output: String::from_utf8_lossy(&out.output).into_owned(),
+        log: out.log,
+    }
+}
+
+/// Result of a `cd-hit-lap` run.
+#[wasm_bindgen(getter_with_clone)]
+pub struct LapResult {
+    /// Representative sequences (FASTA/FASTQ).
+    pub rep: String,
+    /// Cluster membership file (`.clstr`).
+    pub clstr: String,
+    /// Log text.
+    pub log: String,
+}
+
+/// Cluster overlapping reads (`cd-hit-lap`). `minlen` = `-m`, `minper` = `-p`,
+/// `deslen` = `-d`.
+#[wasm_bindgen]
+pub fn lap(fastaq: &str, minlen: i32, minper: f32, deslen: i32) -> LapResult {
+    let out = cd_hit_lap(
+        fastaq.as_bytes(),
+        &LapParams {
+            minlen,
+            minper,
+            deslen,
+            seed: 0,
+        },
+    );
+    LapResult {
+        rep: String::from_utf8_lossy(&out.rep).into_owned(),
+        clstr: String::from_utf8_lossy(&out.clstr).into_owned(),
+        log: out.log,
+    }
+}
+
+/// Result of a `cd-hit-dup` run (single-end).
+#[wasm_bindgen(getter_with_clone)]
+pub struct DupResult {
+    /// Representative reads (FASTA/FASTQ).
+    pub reps: String,
+    /// Cluster membership file (`.clstr`).
+    pub clstr: String,
+    /// Chimeric-cluster file (`2.clstr`).
+    pub clstr2: String,
+    /// Log text.
+    pub log: String,
+}
+
+/// Detect duplicate / near-duplicate reads (`cd-hit-dup`, single-end).
+/// `errors` = `-e`, `match_length` = `-m`, `uselen` = `-u`, `nochimeric` = `-f`.
+#[wasm_bindgen]
+pub fn dedup(
+    fastaq: &str,
+    errors: i32,
+    match_length: bool,
+    uselen: i32,
+    nochimeric: bool,
+) -> Result<DupResult, String> {
+    let out = cd_hit_dup(
+        fastaq.as_bytes(),
+        &DupParams {
+            input_name: "in",
+            input2: None,
+            match_length,
+            abundance: -1,
+            deslen: 0,
+            uselen,
+            errors,
+            errors2: errors as f32,
+            nochimeric,
+            shared: 30,
+            abratio: 1.0,
+            percent: 1.0,
+        },
+    )?;
+    Ok(DupResult {
+        reps: String::from_utf8_lossy(&out.reps_r1).into_owned(),
+        clstr: String::from_utf8_lossy(&out.clstr).into_owned(),
+        clstr2: String::from_utf8_lossy(&out.clstr2).into_owned(),
+        log: out.log,
     })
 }

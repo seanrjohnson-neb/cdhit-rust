@@ -26,8 +26,34 @@ differential testing:
 | `cd-hit-lap` | Cluster reads that overlap end-to-end |
 | `read-linker` | Join paired-end reads by 3'/5' overlap |
 
-Not yet ported (out of scope for now): the Perl post-processing scripts and
-`psi-cd-hit`.
+Many of the Perl `.clstr` post-processing scripts are also ported, as `cdhit
+<name>` subcommands, each verified byte-identical to the reference Perl:
+
+| Subcommand | Perl script | Description |
+|---|---|---|
+| `clstr_sort_by` | `clstr_sort_by.pl` | Sort clusters by size or representative length |
+| `clstr_size_stat` | `clstr_size_stat.pl` | Distribution of cluster sizes |
+| `clstr_size_histogram` | `clstr_size_histogram.pl` | Binned histogram of cluster sizes |
+| `clstr2txt` | `clstr2txt.pl` | Tabular per-sequence view |
+| `clstr_renumber` | `clstr_renumber.pl` | Renumber clusters and members |
+| `clstr_select` | `clstr_select.pl` | Select clusters by size range |
+| `clstr_cut` | `clstr_cut.pl` | Keep the top N members per cluster |
+| `clstr_rep` | `clstr_rep.pl` | List representative of each cluster |
+| `clstr2tree` | `clstr2tree.pl` | Newick-like tree |
+| `cd-hit-clstr_2_blm8` | `cd-hit-clstr_2_blm8.pl` | Convert to BLAST tabular (m8) |
+| `clstr_reduce` | `clstr_reduce.pl` | Sub-sample clusters by size segment |
+| `clstr_rev` | `clstr_rev.pl` | Flatten a two-level hierarchical clustering |
+| `clstr_merge` | `clstr_merge.pl` | Merge divided cluster files into a master |
+| `clstr_reps_faa_rev` | `clstr_reps_faa_rev.pl` | Keep the top N sequences per cluster from a FASTA |
+
+Not ported: `psi-cd-hit` (orchestrates external BLAST/PSI-BLAST — not
+WASM-relevant) and the `cd-hit-para.pl` / `cd-hit-2d-para.pl` grid wrappers
+(superseded by the `-T` rayon parallelism). Some Perl scripts are intentionally
+**not** ported because they cannot be made bit-for-bit reproducible or need
+non-portable dependencies: `FET.pl` (external CPAN `Text::NSP` module + Perl
+`Storable` + hash-ordered output), `clstr_quality_eval*.pl` and `clstr2xml.pl`
+(emit in Perl hash-iteration order), `clstr_list.pl` (Perl `Storable` binary
+format), and the `plot_*.pl` / `clstr_sql_tbl*.pl` helpers (GD/gnuplot / SQL).
 
 The `cd-hit-auxtools` programs work on FASTA/FASTQ, share the `cdhit-core`
 crate, and — like the clustering programs — build for WebAssembly.
@@ -60,6 +86,11 @@ cargo build --release
 ./target/release/cdhit cd-hit-dup  -i R1.fq -i2 R2.fq -o uniq -o2 uniq.R2
 ./target/release/cdhit cd-hit-lap  -i reads.fa -o out -m 20
 ./target/release/cdhit read-linker -1 R1.fq -2 R2.fq -o contigs.fq -l 10 -e 1
+
+# .clstr post-processing (read a file arg or stdin; write to stdout)
+./target/release/cdhit clstr_sort_by len out.clstr > sorted.clstr
+./target/release/cdhit clstr_size_stat out.clstr
+./target/release/cdhit clstr2txt out.clstr > table.tsv
 ```
 
 Output is written to `<output>` (representatives) and `<output>.clstr`
@@ -102,6 +133,45 @@ Rust == C++ across many option combinations.
 The port deliberately mirrors several C++ quirks required for exact output
 (e.g. the word-count power-table integer overflow, the `-g 1` cutoff-update
 behaviour, and float-promoted-to-double threshold comparisons).
+
+## Reproduced upstream quirks and bugs
+
+To stay byte-identical, the port faithfully reproduces a number of quirks —
+including outright bugs and undefined behaviour — in the original C++/Perl.
+These are matched deliberately; "fixing" them would break output parity.
+
+**Clustering engine (`cdhit-common`)**
+- Word-count power-table **integer overflow** is reproduced exactly.
+- `-g 1` cutoff-update behaviour and float→double threshold promotion.
+
+**cd-hit-auxtools**
+- **`bioSequence` parser**: residues of *every record except the file's last*
+  are upper-cased; the C++ omits `ToUpper()` on the final flush, so the last
+  record keeps its original case.
+- **`read-linker`**: the emitted `mismatch_no=` uses the overlap-check error
+  count (which also counts `N`/`N` pairs), not the number of real substitutions
+  used to enumerate contigs. Reads are also processed in fixed batches of
+  10000, so a batch's tail is dropped when the two mates' files are of unequal
+  length.
+- **`cd-hit-dup -f`/`-s` (chimera filtering)**: the reference `DetectChimeric`
+  reads out of bounds (e.g. it always inspects the top *two* candidate offsets
+  even when only one exists) — undefined behaviour. The port reproduces the
+  well-defined behaviour bit-for-bit and *guards* the OOB accesses, so it may
+  diverge only on the degenerate cases the C++ leaves undefined.
+- **`cd-hit-dup -u`/paired-end**: full-length reads are restored for output by
+  re-reading the input and copying **by index** into the (possibly length-sorted)
+  working list — a latent mismatch when sorting occurred. Reproduced as-is.
+
+**Perl `.clstr` post-processing scripts**
+- **`cd-hit-clstr_2_blm8`**: protein (`aa`) clusters and strand-only nucleotide
+  lines have no alignment coordinates, so the script emits deterministic
+  "garbage" — negative alignment lengths and bit scores, and a raw string
+  (`97.50%` or `+`) in the `q_b` column — via Perl's string→number coercion.
+  Matched exactly, including Perl's `%.15g` number formatting.
+- **`clstr2tree`**: branch length `1-fr` is emitted with Perl's `%.15g`
+  stringification (so `1-0.8` prints as `0.2`, not `0.199999…`).
+- **`clstr_rep`**: only recognises protein (`aa`) representative lines; a
+  non-`aa` representative is treated as a format error, as upstream.
 
 ## Portability notes / differences from upstream
 

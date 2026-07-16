@@ -51,7 +51,12 @@ fn usage() -> ! {
          \n\
          Run a clustering program with -i <input> -o <output> -c <threshold> ...\n\
          Output is written to <output> (representatives) and <output>.clstr.\n\
-         The auxtools programs use their own flags; run one with no args for help."
+         The auxtools programs use their own flags; run one with no args for help.\n\
+         \n\
+         .clstr post-processing (read a file arg or stdin, write stdout):\n\
+         \x20 clstr_sort_by, clstr_size_stat, clstr_size_histogram, clstr2txt,\n\
+         \x20 clstr_renumber, clstr_select, clstr_cut, clstr_rep, clstr2tree,\n\
+         \x20 cd-hit-clstr_2_blm8, clstr_reduce, clstr_rev, clstr_merge, clstr_reps_faa_rev."
     );
     exit(1);
 }
@@ -427,6 +432,88 @@ fn try_run_clstr(name: &str, args: &[String]) -> bool {
         "clstr2txt" | "clstr2txt.pl" => {
             let input = read_clstr_input(args.first().map(|s| s.as_str()));
             stdout.write_all(&clstr_ops::to_txt(&input)).ok();
+        }
+        "clstr_renumber" | "clstr-renumber" => {
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            stdout.write_all(&clstr_ops::renumber(&input)).ok();
+        }
+        "clstr_select" | "clstr-select" => {
+            let min: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let max: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let input = read_clstr_input(args.get(2).map(|s| s.as_str()));
+            stdout.write_all(&clstr_ops::select(&input, min, max)).ok();
+        }
+        "clstr_cut" | "clstr-cut" => {
+            let n: i64 = match args.first().and_then(|s| s.parse().ok()) {
+                Some(n) if n != 0 => n,
+                _ => {
+                    print!("no number\n");
+                    exit(1);
+                }
+            };
+            let input = read_clstr_input(args.get(1).map(|s| s.as_str()));
+            stdout.write_all(&clstr_ops::cut(&input, n)).ok();
+        }
+        "clstr_rep" | "clstr-rep" => {
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            match clstr_ops::rep(&input) {
+                Ok(o) => {
+                    stdout.write_all(&o).ok();
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
+        "clstr2tree" | "clstr2tree.pl" => {
+            // clstr2tree.pl <clstr> <fr>
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            let fr = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            stdout.write_all(&clstr_ops::to_tree(&input, fr)).ok();
+        }
+        "cd-hit-clstr_2_blm8" | "cd-hit-clstr_2_blm8.pl" => {
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            stdout.write_all(&clstr_ops::to_blm8(&input)).ok();
+        }
+        "clstr_reduce" | "clstr-reduce" => {
+            // clstr_reduce.pl <clstr> <segs> <rate>
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            let segs = args.get(1).map(|s| s.as_str()).unwrap_or("");
+            let rate: i64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
+            stdout.write_all(&clstr_ops::reduce(&input, segs, rate.max(1))).ok();
+        }
+        "clstr_rev" | "clstr-rev" => {
+            // clstr_rev.pl <file90> <file80>
+            let f90 = read_clstr_input(args.first().map(|s| s.as_str()));
+            let f80 = read_clstr_input(args.get(1).map(|s| s.as_str()));
+            stdout.write_all(&clstr_ops::rev(&f90, &f80)).ok();
+        }
+        "clstr_merge" | "clstr-merge" => {
+            // clstr_merge.pl <master> <div1> [div2 ...]
+            if args.len() < 2 {
+                eprintln!("Usage: clstr_merge <master.clstr> <div1.clstr> [div2.clstr ...]");
+                exit(1);
+            }
+            let master = read_clstr_input(Some(&args[0]));
+            let divs: Vec<Vec<u8>> = args[1..]
+                .iter()
+                .map(|p| read_clstr_input(Some(p)))
+                .collect();
+            let div_refs: Vec<&[u8]> = divs.iter().map(|d| d.as_slice()).collect();
+            stdout.write_all(&clstr_ops::merge(&master, &div_refs)).ok();
+        }
+        "clstr_reps_faa_rev" | "clstr_reps_faa_rev.pl" => {
+            // clstr_reps_faa_rev.pl <clstr> <fasta> <cutoff>
+            if args.len() < 3 {
+                exit(1);
+            }
+            let clstr = read_clstr_input(Some(&args[0]));
+            let fasta = read_clstr_input(Some(&args[1]));
+            let cutoff: usize = args[2].parse().unwrap_or(0);
+            stdout
+                .write_all(&clstr_ops::reps_faa_rev(&clstr, &fasta, cutoff))
+                .ok();
         }
         _ => return false,
     }

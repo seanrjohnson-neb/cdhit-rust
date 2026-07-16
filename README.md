@@ -105,8 +105,11 @@ behaviour, and float-promoted-to-double threshold comparisons).
     and parallel overhead dominate, so it may not help).
   - **Use `-T 1` (the default) for output byte-identical to the reference C++
     serial algorithm.** WASM builds are single-threaded (`--no-default-features`).
-- **`-B` disk swap**: dropped. The database is held in memory (this removes the
-  non-portable temp-file path and is required for WASM). Very large inputs are
-  bounded by available memory.
+- **`-B` disk swap** (and its `-tmp` companion): accepted for command-line
+  compatibility but a no-op — exactly as in current upstream CD-HIT, which itself
+  disabled disk-swap (its read paths are annotated "disable swap option"), so
+  `-B 1` produces output identical to `-B 0`. The database is held in memory
+  (this removes the non-portable temp-file path and is required for WASM). Very
+  large inputs are bounded by available memory.
 - **zlib**: replaced by the `flate2` crate (`gzip` feature, on by default for
   native, off for WASM).

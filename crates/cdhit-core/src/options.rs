@@ -48,6 +48,12 @@ pub struct Options {
     pub min_length: i32,
     pub cluster_best: bool,
     pub global_identity: bool,
+    /// `-B`: accepted for CLI compatibility but a no-op. Upstream CD-HIT itself
+    /// disabled disk-swap (~2019; all read paths are marked "disable swap
+    /// option"), so `-B 1` produces output identical to `-B 0`. We hold the
+    /// database in memory for portability (required for WASM, which has no
+    /// filesystem). The field is parsed and retained but never consulted by the
+    /// engine. See also the `-tmp` companion flag below.
     pub store_disk: bool,
     pub band_width: i32,
     pub cluster_thd: f64,
@@ -247,6 +253,8 @@ impl Options {
             "-d" => self.des_len = intval,
             "-s" => self.diff_cutoff = atof(value),
             "-S" => self.diff_cutoff_aa = intval,
+            // Accepted for compatibility; a no-op (see `store_disk` doc). Kept
+            // as a real flag so `-B N` never triggers the unknown-option path.
             "-B" => self.store_disk = intval != 0,
             "-P" => self.pe_mode = intval,
             "-cx" => self.trim_len = intval,
@@ -595,6 +603,23 @@ mod tests {
         .unwrap();
         let mut hints = vec![];
         o.validate(&mut hints).unwrap();
+    }
+
+    #[test]
+    fn dash_b_is_accepted_and_parsed() {
+        // `-B` must parse as a known flag (never hit the unknown-option error)
+        // and set `store_disk`. It is a no-op for the engine, but stays a real
+        // flag so `-B N` is accepted for CLI compatibility.
+        let mut sc = Scoring::default();
+        let o = Options::parse(
+            &args(&["-i", "in.fa", "-o", "out", "-c", "0.9", "-n", "5", "-B", "1"]),
+            false,
+            false,
+            &mut sc,
+        )
+        .unwrap();
+        assert!(o.store_disk);
+        assert!(!Options::default().store_disk);
     }
 
     #[test]

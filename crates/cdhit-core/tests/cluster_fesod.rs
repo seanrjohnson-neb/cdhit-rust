@@ -100,3 +100,27 @@ fn identity_boundary_70pct_matches_cpp() {
     .unwrap();
     assert_eq!(out.clstr, expected);
 }
+
+/// `-B` (disk-swap) is accepted but a no-op — upstream disabled disk-swap, so
+/// `-B 1` must produce output byte-identical to omitting it (and to the golden).
+#[test]
+fn fesod_b1_is_a_noop() {
+    let fa = include_bytes!("data/fesod.fasta");
+    let expected_clstr = include_str!("data/fesod_c0.9_n5.clstr");
+    let baseline = cluster_1d(
+        fa,
+        &args(&["-i", "x", "-o", "y", "-c", "0.9", "-n", "5"]),
+        false,
+    )
+    .unwrap();
+    let with_b = cluster_1d(
+        fa,
+        &args(&["-i", "x", "-o", "y", "-c", "0.9", "-n", "5", "-B", "1"]),
+        false,
+    )
+    .unwrap();
+    assert_eq!(with_b.clstr, baseline.clstr);
+    assert_eq!(with_b.rep_fasta, baseline.rep_fasta);
+    // And still matches the captured C++ golden.
+    assert_eq!(with_b.clstr, expected_clstr);
+}

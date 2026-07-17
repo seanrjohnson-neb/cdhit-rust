@@ -8,6 +8,8 @@ The port reproduces the CD-HIT clustering algorithm with **bit-for-bit output
 fidelity**: for the supported programs and options, the `.clstr` file and the
 representative FASTA are byte-identical to the reference C++ (`make openmp=no`).
 
+The port was done almost entirely by Claude 4.8. Bug reports and pull requests welcome.
+
 ## Status
 
 All six clustering programs plus the three `cd-hit-auxtools` programs are

@@ -1,0 +1,16 @@
+@r1 read one
+ACGTACGTAC
++
+IIIIIIIIII
+@r2 read two
+TTTTACGTAC
++
+IIIIIIIIII
+@r3 read three
+GGGGACGTAC
++
+IIIIIIIIII
+@r4 read four
+CCCCACGTAC
++
+IIIIIIIIII

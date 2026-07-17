@@ -54,9 +54,15 @@ fn usage() -> ! {
          The auxtools programs use their own flags; run one with no args for help.\n\
          \n\
          .clstr post-processing (read a file arg or stdin, write stdout):\n\
-         \x20 clstr_sort_by, clstr_size_stat, clstr_size_histogram, clstr2txt,\n\
-         \x20 clstr_renumber, clstr_select, clstr_cut, clstr_rep, clstr2tree,\n\
-         \x20 cd-hit-clstr_2_blm8, clstr_reduce, clstr_rev, clstr_merge, clstr_reps_faa_rev."
+         \x20 clstr_sort_by, clstr_sort_prot_by, clstr_size_stat, clstr_size_histogram,\n\
+         \x20 clstr2txt, clstr_renumber, clstr_select, clstr_select_rep, clstr_cut,\n\
+         \x20 clstr_rep, clstr2tree, cd-hit-clstr_2_blm8, clstr_reduce, clstr_rev,\n\
+         \x20 clstr_merge, clstr_merge_noorder, clstr_reps_faa_rev, plot_len1,\n\
+         \x20 clstr_quality_eval_by_link, clstr_sql_tbl_sort.\n\
+         \n\
+         .clstr post-processing that writes files (native only):\n\
+         \x20 clstr_sql_tbl <clstr> <tbl>, make_multi_seq <fasta> <clstr> <dir> [size],\n\
+         \x20 cd-hit-dup-PE-out -i R1 -j R2 -c clstr -o out1 -p out2."
     );
     exit(1);
 }
@@ -377,6 +383,68 @@ fn run_cd_hit_dup(rest: &[String]) {
     }
 }
 
+const DUP_PE_OUT_USAGE: &str = "This script exports the representative PE reads into two seperate files after running\n\
+cd-hit-dup\n \n\
+    \x20    -i fasta or fastq file of PE read 1\n\
+    \x20    -j fasta or fastq file of PE read 2\n\
+    \x20    -c .clstr file produced by cd-hit-dup\n\
+    \x20    -o output file of representative reads, PE read 1\n\
+    \x20    -p output file of representative reads, PE read 2\n";
+
+/// `cd-hit-dup-PE-out`: export representative paired-end reads to two files,
+/// given the `.clstr` from `cd-hit-dup`. Flags mirror the Perl `getopts`.
+fn run_dup_pe_out(args: &[String]) {
+    let mut fastq1 = String::new();
+    let mut fastq2 = String::new();
+    let mut clstr_file = String::new();
+    let mut out1 = String::new();
+    let mut out2 = String::new();
+    let mut i = 0;
+    while i + 1 < args.len() {
+        let v = &args[i + 1];
+        match args[i].as_str() {
+            "-i" => fastq1 = v.clone(),
+            "-j" => fastq2 = v.clone(),
+            "-c" => clstr_file = v.clone(),
+            "-o" => out1 = v.clone(),
+            "-p" => out2 = v.clone(),
+            _ => {}
+        }
+        i += 2;
+    }
+    if fastq1.is_empty()
+        || fastq2.is_empty()
+        || out1.is_empty()
+        || out2.is_empty()
+        || clstr_file.is_empty()
+    {
+        print!("{DUP_PE_OUT_USAGE}");
+        exit(255);
+    }
+
+    let read = |p: &str| -> Vec<u8> {
+        match read_input(p) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("can not open {p}");
+                exit(1);
+            }
+        }
+    };
+    let clstr = read(&clstr_file);
+    let in1 = read(&fastq1);
+    let in2 = read(&fastq2);
+    let out = clstr_ops::dup_pe_out(&clstr, &in1, &in2);
+    if let Err(e) = std::fs::write(&out1, &out.out1) {
+        eprintln!("can not write to {out1}: {e}");
+        exit(1);
+    }
+    if let Err(e) = std::fs::write(&out2, &out.out2) {
+        eprintln!("can not write to {out2}: {e}");
+        exit(1);
+    }
+}
+
 /// Read `.clstr`-style text from a file path, or from stdin when `path` is None.
 fn read_clstr_input(path: Option<&str>) -> Vec<u8> {
     match path {
@@ -514,6 +582,152 @@ fn try_run_clstr(name: &str, args: &[String]) -> bool {
             stdout
                 .write_all(&clstr_ops::reps_faa_rev(&clstr, &fasta, cutoff))
                 .ok();
+        }
+        "clstr_select_rep" | "clstr-select-rep" => {
+            // clstr_select_rep.pl <min> <max> [file]
+            let min: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let max: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let input = read_clstr_input(args.get(2).map(|s| s.as_str()));
+            match clstr_ops::select_rep(&input, min, max) {
+                Ok(o) => {
+                    stdout.write_all(&o).ok();
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
+        "clstr_sort_prot_by" | "clstr-sort-prot-by" => {
+            // clstr_sort_prot_by.pl [len|id] < file   (key is the first positional)
+            let key = args.first().map(|s| s.as_str()).unwrap_or("len");
+            let file = args.get(1).map(|s| s.as_str());
+            let input = read_clstr_input(file);
+            stdout.write_all(&clstr_ops::sort_prot_by(&input, key)).ok();
+        }
+        "clstr_merge_noorder" | "clstr-merge-noorder" => {
+            // clstr_merge_noorder.pl <master> <div1> [div2 ...]
+            if args.len() < 2 {
+                eprintln!("Usage: clstr_merge_noorder <master.clstr> <div1.clstr> [div2.clstr ...]");
+                exit(1);
+            }
+            let master = read_clstr_input(Some(&args[0]));
+            let divs: Vec<Vec<u8>> = args[1..].iter().map(|p| read_clstr_input(Some(p))).collect();
+            let div_refs: Vec<&[u8]> = divs.iter().map(|d| d.as_slice()).collect();
+            stdout
+                .write_all(&clstr_ops::merge_noorder(&master, &div_refs))
+                .ok();
+        }
+        "clstr_quality_eval_by_link" | "clstr-quality-eval-by-link" => {
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            match clstr_ops::quality_eval_by_link(&input) {
+                Ok(o) => {
+                    stdout.write_all(&o).ok();
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
+        "plot_len1" | "plot_len1.pl" => {
+            // plot_len1.pl <clstr> <segs> <len_segs>
+            if args.len() < 3 {
+                eprintln!("Usage: plot_len1 <clstr> <size_segs> <length_segs>");
+                eprintln!("  e.g. plot_len1 in.clstr 1,2-5,6-up 1-100,101-200,201-up");
+                exit(1);
+            }
+            let input = read_clstr_input(Some(&args[0]));
+            stdout
+                .write_all(&clstr_ops::plot_len1(&input, &args[1], &args[2]))
+                .ok();
+        }
+        "clstr_sql_tbl_sort" | "clstr-sql-tbl-sort" => {
+            // clstr_sql_tbl_sort.pl <table_file> <level>
+            if args.is_empty() {
+                print!("Usage:\n\tclstr_sql_tbl_sort.pl table_file level\n");
+                exit(1);
+            }
+            let input = read_clstr_input(Some(&args[0]));
+            let level: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            eprintln!("done reading {}", args[0]);
+            match clstr_ops::sql_tbl_sort(&input, level) {
+                Ok(o) => {
+                    stdout.write_all(&o).ok();
+                }
+                Err(e) => {
+                    print!("{e}\n");
+                    exit(1);
+                }
+            }
+        }
+        "cd-hit-dup-PE-out" | "cd-hit-dup-PE-out.pl" => {
+            run_dup_pe_out(args);
+        }
+        "clstr_sql_tbl" | "clstr-sql-tbl" => {
+            // clstr_sql_tbl.pl <clstr_file> <tbl_file>: create the table if it
+            // does not exist, otherwise append two columns for this level.
+            if args.len() < 2 {
+                print!("Usage:\n\tclstr_sql_tbl.pl clstr_file tbl_file\n");
+                exit(1);
+            }
+            let clstr = read_clstr_input(Some(&args[0]));
+            let tbl_path = &args[1];
+            let result = if std::path::Path::new(tbl_path).exists() {
+                let existing = read_clstr_input(Some(tbl_path));
+                eprintln!("done reading {}", args[0]);
+                clstr_ops::sql_tbl(&clstr, Some(&existing))
+            } else {
+                clstr_ops::sql_tbl(&clstr, None)
+            };
+            match result {
+                Ok(o) => {
+                    if let Err(e) = std::fs::write(tbl_path, &o) {
+                        eprintln!("Failed to write '{tbl_path}': {e}");
+                        exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
+        "make_multi_seq" | "make_multi_seq.pl" => {
+            // make_multi_seq.pl <fasta> <clstr> <out_dir> <size_cutoff>
+            if args.len() < 3 {
+                eprintln!("Usage: make_multi_seq <fasta> <clstr> <out_dir> [size_cutoff]");
+                exit(1);
+            }
+            let fasta = read_clstr_input(Some(&args[0]));
+            let clstr = read_clstr_input(Some(&args[1]));
+            let out_dir = &args[2];
+            // Perl: size_cutoff defaults to 1; a 0/non-numeric value also -> 1.
+            let cutoff = args
+                .get(3)
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n != 0)
+                .unwrap_or(1);
+            if let Err(e) = std::fs::create_dir_all(out_dir) {
+                eprintln!("can not create {out_dir}: {e}");
+                exit(1);
+            }
+            match clstr_ops::make_multi_seq(&fasta, &clstr, cutoff) {
+                Ok(files) => {
+                    for f in files {
+                        let name = String::from_utf8_lossy(&f.cid);
+                        let path = format!("{out_dir}/{name}");
+                        if let Err(e) = std::fs::write(&path, &f.content) {
+                            eprintln!("can not open file to write {path}: {e}");
+                            exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
         }
         _ => return false,
     }

@@ -44,16 +44,26 @@ Many of the Perl `.clstr` post-processing scripts are also ported, as `cdhit
 | `clstr_reduce` | `clstr_reduce.pl` | Sub-sample clusters by size segment |
 | `clstr_rev` | `clstr_rev.pl` | Flatten a two-level hierarchical clustering |
 | `clstr_merge` | `clstr_merge.pl` | Merge divided cluster files into a master |
+| `clstr_merge_noorder` | `clstr_merge_noorder.pl` | Merge divided cluster files whose cluster order need not match |
 | `clstr_reps_faa_rev` | `clstr_reps_faa_rev.pl` | Keep the top N sequences per cluster from a FASTA |
+| `clstr_select_rep` | `clstr_select_rep.pl` | Print representatives of clusters within a size range |
+| `clstr_sort_prot_by` | `clstr_sort_prot_by.pl` | Sort members within each cluster by length or id |
+| `clstr_quality_eval_by_link` | `clstr_quality_eval_by_link.pl` | Sensitivity/specificity vs a benchmark (independent links) |
+| `plot_len1` | `plot_len1.pl` | Tabular sequence/cluster counts by size × representative-length bins |
+| `clstr_sql_tbl` | `clstr_sql_tbl.pl` | Build/extend a hierarchical cluster table (`id len cid rep`, two columns per level) |
+| `clstr_sql_tbl_sort` | `clstr_sql_tbl_sort.pl` | Stable-sort a cluster SQL table by hierarchy columns |
+| `make_multi_seq` | `make_multi_seq.pl` | Write one FASTA file per cluster above a size cutoff |
+| `cd-hit-dup-PE-out` | `cd-hit-dup-PE-out.pl` | Export representative paired-end reads after `cd-hit-dup` |
 
 Not ported: `psi-cd-hit` (orchestrates external BLAST/PSI-BLAST — not
 WASM-relevant) and the `cd-hit-para.pl` / `cd-hit-2d-para.pl` grid wrappers
 (superseded by the `-T` rayon parallelism). Some Perl scripts are intentionally
 **not** ported because they cannot be made bit-for-bit reproducible or need
 non-portable dependencies: `FET.pl` (external CPAN `Text::NSP` module + Perl
-`Storable` + hash-ordered output), `clstr_quality_eval*.pl` and `clstr2xml.pl`
+`Storable` + hash-ordered output), `clstr_quality_eval.pl` and `clstr2xml.pl`
 (emit in Perl hash-iteration order), `clstr_list.pl` (Perl `Storable` binary
-format), and the `plot_*.pl` / `clstr_sql_tbl*.pl` helpers (GD/gnuplot / SQL).
+format), and `plot_2d.pl` (ImageMagick / non-deterministic drawing). See
+[Remaining Perl scripts](#remaining-perl-scripts) for the full breakdown.
 
 The `cd-hit-auxtools` programs work on FASTA/FASTQ, share the `cdhit-core`
 crate, and — like the clustering programs — build for WebAssembly.
@@ -91,6 +101,17 @@ cargo build --release
 ./target/release/cdhit clstr_sort_by len out.clstr > sorted.clstr
 ./target/release/cdhit clstr_size_stat out.clstr
 ./target/release/cdhit clstr2txt out.clstr > table.tsv
+./target/release/cdhit clstr_select_rep 2 100 out.clstr > reps.txt
+./target/release/cdhit plot_len1 out.clstr 1,2-5,6-up 1-100,101-200,201-up
+
+# cd-hit-dup-PE-out uses getopts-style flags and writes two files
+./target/release/cdhit cd-hit-dup-PE-out -i R1.fq -j R2.fq -c uniq.clstr \
+    -o rep.R1.fq -p rep.R2.fq
+
+# a few .clstr helpers write files rather than stdout (native only)
+./target/release/cdhit make_multi_seq db.faa out.clstr multi-seq 20  # one FASTA/cluster
+./target/release/cdhit clstr_sql_tbl db90.clstr tbl.txt              # create the table
+./target/release/cdhit clstr_sql_tbl db60.clstr tbl.txt              # append the next level
 ```
 
 Output is written to `<output>` (representatives) and `<output>.clstr`
@@ -201,3 +222,36 @@ These are matched deliberately; "fixing" them would break output parity.
   large inputs are bounded by available memory.
 - **zlib**: replaced by the `flate2` crate (`gzip` feature, on by default for
   native, off for WASM).
+
+## Remaining Perl scripts
+
+The high-priority "best candidates" have all been ported (see the subcommand
+table above), each verified byte-identical to the reference Perl:
+`clstr_select_rep`, `clstr_sort_prot_by`, `clstr_merge_noorder`,
+`cd-hit-dup-PE-out`, `clstr_quality_eval_by_link`, `plot_len1`, and
+`clstr_sql_tbl_sort`.
+
+Two more native-only helpers have since been ported (also byte-identical):
+`make_multi_seq` (one FASTA per cluster) and `clstr_sql_tbl` (the table producer
+that `clstr_sql_tbl_sort` consumes).
+
+The following scripts remain unported. The first group is portable but each
+carries a caveat; the second group is out of scope for the Windows/WASM story.
+
+**Useful, but with caveats**
+
+| Script | Feasibility | Notes |
+|---|---|---|
+| `cd-hit-div.pl` | High | Round-robin split without sorting; differs from the ported `cd-hit-div`. Mainly historical wrapper compatibility. |
+| `clstr_quality_eval.pl` | Medium | Aggregate metrics are easy, but the pair-list sections iterate Perl hashes, so byte-identical output is not stable (only the link-based variant is ported). |
+| `clstr2xml.pl` | Medium | Output order depends on Perl hash iteration; a deterministic XML writer would be better than byte-parity. |
+
+**Out of scope**
+
+| Script | Notes |
+|---|---|
+| `FET.pl` | Depends on `Text::NSP`, Perl `Storable`, and hash-ordered output. Fisher exact could be reimplemented, but not as byte-identical Perl compatibility. |
+| `clstr_list.pl` / `clstr_list_sort.pl` | Revolve around Perl `Storable` binary structures — not portable or useful for WASM. |
+| `plot_2d.pl` | Depends on ImageMagick and random drawing; output is not deterministic. |
+| `cd-hit-para.pl` / `cd-hit-2d-para.pl` | Orchestrate distributed jobs via ssh/qsub; superseded by native `-T` rayon support. |
+| `psi-cd-hit` | Requires BLAST/PSI-BLAST, `makeblastdb`, and local/qsub orchestration — a separate native-only project if desired. |

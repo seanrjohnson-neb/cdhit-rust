@@ -1,0 +1,14 @@
+>Cluster 0
+0	200aa, >s1||famA... *
+1	198aa, >s2||famA... at 97.00%
+2	195aa, >s3||famB... at 96.00%
+3	190aa, >s4||famA... at 95.00%
+>Cluster 1
+0	150aa, >s5||famB... *
+1	148aa, >s6||famB... at 98.00%
+2	140aa, >s7... at 90.00%
+>Cluster 2
+0	120aa, >s8||famC... *
+>Cluster 3
+0	100aa, >s9||famA... *
+1	99aa, >s10||famB... at 91.00%

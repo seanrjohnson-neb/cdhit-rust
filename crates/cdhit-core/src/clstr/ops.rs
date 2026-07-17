@@ -636,6 +636,692 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
+/// True if a member line contains the `(aa|nt), >` form the Perl regexes
+/// require (`(\d+)(aa|nt), >(.+)\.\.\.`). Lines that don't match are skipped
+/// by scripts like `clstr_sort_prot_by.pl`.
+fn has_len_id(raw: &[u8]) -> bool {
+    find(raw, b"aa, >").is_some() || find(raw, b"nt, >").is_some()
+}
+
+/// Drop a leading run of digits followed by a single tab (Perl `s/^\d+\t//`).
+fn strip_leading_index_tab(raw: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    while i < raw.len() && raw[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < raw.len() && raw[i] == b'\t' {
+        raw[i + 1..].to_vec()
+    } else {
+        raw.to_vec()
+    }
+}
+
+/// `clstr_select_rep.pl <min> <max>`: for each cluster whose member count is
+/// within `[min, max]`, print the representative id (an empty line if the
+/// cluster has no representative). A representative line that is not `aa`/`nt`
+/// is a format error, as upstream.
+pub fn select_rep(input: &[u8], min: usize, max: usize) -> Result<Vec<u8>, String> {
+    let clusters = parse_clstr(input);
+    let mut out = Vec::new();
+    for c in &clusters {
+        let no = c.size();
+        let mut rep: Vec<u8> = Vec::new();
+        for m in &c.members {
+            if m.is_rep {
+                // /\*$/ then require /\d+(aa|nt), >(.+)\.\.\./
+                if !has_len_id(&m.raw) || m.id.is_empty() {
+                    return Err(format!("format error {}", String::from_utf8_lossy(&m.raw)));
+                }
+                rep = m.id.clone();
+            }
+        }
+        if no >= min && no <= max {
+            out.extend_from_slice(&rep);
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+/// `clstr_sort_prot_by.pl [len|id|<other>]`: sort the members *within* each
+/// cluster, re-emitting the cluster header verbatim then `<i>\t<line>` for each
+/// member (the leading `\d+\t` index is stripped, then re-added as the new
+/// rank). Representatives sort first (their length is treated as 99999999).
+///
+/// Sort keys (all stable, matching Perl's stable mergesort):
+/// - `"len"` (default): length descending.
+/// - `"id"`: id ascending, then length descending.
+/// - anything else: length descending, then id ascending.
+pub fn sort_prot_by(input: &[u8], sort_by: &str) -> Vec<u8> {
+    let clusters = parse_clstr(input);
+    let mut out = Vec::new();
+    for c in &clusters {
+        // (line-without-index, len, id)
+        let mut items: Vec<(Vec<u8>, i64, &[u8])> = Vec::new();
+        for m in &c.members {
+            if !has_len_id(&m.raw) || m.id.is_empty() {
+                continue;
+            }
+            // Perl sets len to 99999999 when the line matches /\*/ (anywhere);
+            // in practice that is the representative line.
+            let len = if find(&m.raw, b"*").is_some() {
+                99999999
+            } else {
+                m.len
+            };
+            items.push((strip_leading_index_tab(&m.raw), len, m.id.as_slice()));
+        }
+        match sort_by {
+            "len" => items.sort_by(|a, b| b.1.cmp(&a.1)),
+            "id" => items.sort_by(|a, b| a.2.cmp(b.2).then(b.1.cmp(&a.1))),
+            _ => items.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(b.2))),
+        }
+        out.extend_from_slice(&c.header_raw);
+        out.push(b'\n');
+        for (i, (line, _, _)) in items.iter().enumerate() {
+            out.extend_from_slice(format!("{}\t", i).as_bytes());
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// `clstr_merge_noorder.pl <master> <div1> [div2 ...]`: like `clstr_merge` but
+/// the div clusters may appear in any order — each div file is read fully into
+/// a `rep_id -> [member lines]` map, then master clusters are printed verbatim
+/// with the matching div members appended and renumbered continuously.
+pub fn merge_noorder(master: &[u8], divs: &[&[u8]]) -> Vec<u8> {
+    // slave[rep_id] = accumulated non-representative member lines (verbatim).
+    let mut slave: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for d in divs {
+        for c in parse_clstr(d) {
+            let rep = c.members.iter().find(|m| m.is_rep).map(|m| m.id.clone());
+            let members: Vec<Vec<u8>> = c
+                .members
+                .iter()
+                .filter(|m| !m.is_rep)
+                .map(|m| m.raw.clone())
+                .collect();
+            if !members.is_empty() {
+                // Perl dies here if there is no rep; we skip unmatched members.
+                if let Some(rep) = rep {
+                    slave.entry(rep).or_default().extend(members);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for mc in parse_clstr(master) {
+        let master_rep = match mc.members.iter().find(|m| m.is_rep) {
+            Some(m) => m.id.clone(),
+            None => continue, // Perl only prints clusters that have a rep.
+        };
+        out.extend_from_slice(&mc.header_raw);
+        out.push(b'\n');
+        for m in &mc.members {
+            out.extend_from_slice(&m.raw);
+            out.push(b'\n');
+        }
+        let mut rep_no = mc.members.len();
+        if let Some(list) = slave.get(&master_rep) {
+            for line in list {
+                out.extend_from_slice(&replace_leading_int(line, rep_no));
+                out.push(b'\n');
+                rep_no += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Split an id on the first-and-subsequent `||` separators (Perl
+/// `split(/\|\|/, $id)`).
+fn split_bars(id: &[u8]) -> Vec<&[u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + 1 < id.len() {
+        if id[i] == b'|' && id[i + 1] == b'|' {
+            parts.push(&id[start..i]);
+            i += 2;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(&id[start..]);
+    parts
+}
+
+/// `clstr_quality_eval_by_link.pl`: sensitivity/specificity of the clustering
+/// vs a benchmark encoded in each id as `>seq_id||benchmark_id`. Uses
+/// independent links (n-1 per group of n) rather than all pairs. Output is
+/// deterministic (only sums over hash values are used).
+pub fn quality_eval_by_link(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut bench_count: std::collections::HashMap<Vec<u8>, i64> =
+        std::collections::HashMap::new();
+    let mut total_cdhit_links = 0i64;
+    let mut correct_links = 0i64;
+
+    for c in parse_clstr(input) {
+        let mut clstr_by_ben: std::collections::HashMap<Vec<u8>, i64> =
+            std::collections::HashMap::new();
+        let mut t_no = 0i64;
+        for m in &c.members {
+            if m.id.is_empty() || !has_len_id(&m.raw) {
+                continue;
+            }
+            let parts = split_bars(&m.id);
+            let ben_id = parts.get(1).copied().unwrap_or(b"");
+            // Perl truthiness: skip if undef/empty/"0".
+            if ben_id.is_empty() || ben_id == b"0" {
+                continue;
+            }
+            *bench_count.entry(ben_id.to_vec()).or_insert(0) += 1;
+            *clstr_by_ben.entry(ben_id.to_vec()).or_insert(0) += 1;
+            t_no += 1;
+        }
+        if t_no > 1 {
+            for cnt in clstr_by_ben.values() {
+                correct_links += cnt - 1;
+            }
+            total_cdhit_links += t_no - 1;
+        }
+    }
+
+    let mut total_bench_links = 0i64;
+    for n in bench_count.values() {
+        total_bench_links += n - 1;
+    }
+
+    if total_bench_links == 0 || total_cdhit_links == 0 {
+        return Err("Illegal division by zero".to_string());
+    }
+    let sen = correct_links as f64 / total_bench_links as f64;
+    let spe = correct_links as f64 / total_cdhit_links as f64;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("Total benchmark links\t{}\n", total_bench_links).as_bytes());
+    out.extend_from_slice(format!("Total cd-hit links\t{}\n", total_cdhit_links).as_bytes());
+    out.extend_from_slice(format!("Total correct links\t{}\n", correct_links).as_bytes());
+    out.extend_from_slice(format!("Sensitivity\t{}\n", perl_g(sen)).as_bytes());
+    out.extend_from_slice(format!("Specificity\t {}\n", perl_g(spe)).as_bytes());
+    Ok(out)
+}
+
+/// Parse a decimal integer prefix the way Perl coerces a string to a number,
+/// truncated to an integer (used for the segment bounds of `plot_len1`).
+fn perl_int(s: &[u8]) -> i64 {
+    perl_num(s) as i64
+}
+
+/// `plot_len1.pl <clstr> <segs> <len_segs>`: a tabular count of sequences and
+/// clusters, cross-tabulated by cluster-size segment (`segs`, e.g.
+/// `"1,2-5,6-up"`) against representative-length segment (`len_segs`, e.g.
+/// `"1-100,101-200"`). Despite the name it emits no plot, just the table.
+pub fn plot_len1(input: &[u8], segs: &str, len_segs: &str) -> Vec<u8> {
+    // clstr_nos[size] = #clusters of that size; clstr_len[size] = rep lengths.
+    let mut clstr_nos: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
+    let mut clstr_len: std::collections::HashMap<usize, Vec<i64>> =
+        std::collections::HashMap::new();
+    let mut max_no = 0usize;
+    // `this_len` persists across clusters in the Perl (only reset by a rep line).
+    let mut this_len = 0i64;
+    for c in parse_clstr(input) {
+        let this_no = c.members.len();
+        for m in &c.members {
+            if m.is_rep && has_len_id(&m.raw) {
+                this_len = m.len;
+            }
+        }
+        *clstr_nos.entry(this_no).or_insert(0) += 1;
+        if this_no > max_no {
+            max_no = this_no;
+        }
+        clstr_len.entry(this_no).or_default().push(this_len);
+    }
+
+    let seg_list: Vec<&str> = if segs.is_empty() {
+        Vec::new()
+    } else {
+        segs.split(',').collect()
+    };
+    let len_seg_list: Vec<&str> = if len_segs.is_empty() {
+        Vec::new()
+    } else {
+        len_segs.split(',').collect()
+    };
+
+    let nos = |j: usize| clstr_nos.get(&j).copied().unwrap_or(0);
+    let empty: Vec<i64> = Vec::new();
+    let lens_at = |j: usize| clstr_len.get(&j).unwrap_or(&empty);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"Size\tNo. seq\tNo. clstr");
+    let mut tlen_nos = vec![0i64; len_seg_list.len()];
+    for ls in &len_seg_list {
+        out.extend_from_slice(format!("\t{}", ls).as_bytes());
+    }
+    out.push(b'\n');
+
+    // Parse a length segment into inclusive [b, e] bounds.
+    let len_bounds = |ls: &str| -> (i64, i64) {
+        if let Some((b, e)) = ls.split_once('-') {
+            (perl_int(b.as_bytes()), perl_int(e.as_bytes()))
+        } else {
+            let v = perl_int(ls.as_bytes());
+            (v, v)
+        }
+    };
+
+    let mut tno = 0i64;
+    let mut tno1 = 0i64;
+    for seg in &seg_list {
+        let mut lens: Vec<i64> = Vec::new();
+        if seg.contains('-') {
+            let (b_str, e_str) = seg.split_once('-').unwrap();
+            let b = perl_int(b_str.as_bytes());
+            let e = if e_str.to_ascii_lowercase().contains("up") {
+                max_no as i64
+            } else {
+                perl_int(e_str.as_bytes())
+            };
+            let mut no = 0i64;
+            let mut no1 = 0i64;
+            let mut j = b;
+            while j <= e {
+                if j >= 0 {
+                    let ju = j as usize;
+                    no += j * nos(ju);
+                    no1 += nos(ju);
+                    lens.extend_from_slice(lens_at(ju));
+                }
+                j += 1;
+            }
+            tno += no;
+            tno1 += no1;
+            out.extend_from_slice(format!("{}\t{}\t{}", seg, no, no1).as_bytes());
+        } else {
+            let s = perl_int(seg.as_bytes());
+            let su = if s >= 0 { s as usize } else { usize::MAX };
+            let count = if su == usize::MAX { 0 } else { nos(su) };
+            if su != usize::MAX {
+                lens.extend_from_slice(lens_at(su));
+            }
+            tno += s * count;
+            tno1 += count;
+            // Third column is interpolated `$clstr_nos[$seg]`: empty if unseen.
+            let field3 = match clstr_nos.get(&su) {
+                Some(v) => v.to_string(),
+                None => String::new(),
+            };
+            out.extend_from_slice(format!("{}\t{}\t{}", seg, s * count, field3).as_bytes());
+        }
+        for (j, ls) in len_seg_list.iter().enumerate() {
+            let (lb, le) = len_bounds(ls);
+            let cnt = lens.iter().filter(|&&t| t >= lb && t <= le).count() as i64;
+            out.extend_from_slice(format!("\t{}", cnt).as_bytes());
+            tlen_nos[j] += cnt;
+        }
+        out.push(b'\n');
+    }
+    out.extend_from_slice(format!("Total\t{}\t{}", tno, tno1).as_bytes());
+    for v in &tlen_nos {
+        out.extend_from_slice(format!("\t{}", v).as_bytes());
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Split a line on tabs, dropping trailing empty fields (Perl's default
+/// `split(/\t/, $line)` behaviour).
+fn split_tab_trim(line: &[u8]) -> Vec<&[u8]> {
+    let mut parts: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+    while parts.last() == Some(&(b"".as_slice())) {
+        parts.pop();
+    }
+    parts
+}
+
+/// `clstr_sql_tbl_sort.pl <table_file> <level>`: stable-sort a tab-separated
+/// table by numeric columns counted from the end (last-2 ascending, last
+/// descending; for level 2/3 the preceding column pairs break ties). Returns
+/// an error ("error level") if the first row has fewer than `level*2+2`
+/// columns.
+pub fn sql_tbl_sort(input: &[u8], level: i64) -> Result<Vec<u8>, String> {
+    let mut lls: Vec<Vec<u8>> = input
+        .split_inclusive(|&b| b == b'\n')
+        .map(|l| strip_line(l).to_vec())
+        .collect();
+
+    let first_cols = lls.first().map(|l| split_tab_trim(l).len()).unwrap_or(0);
+    if (first_cols as i64) < level * 2 + 2 {
+        return Err("error level".to_string());
+    }
+
+    // Numeric value of the column `neg` positions from the end (Perl $x[-neg]);
+    // undef (out of range) coerces to 0.
+    let field = |line: &[u8], neg: usize| -> f64 {
+        let cols = split_tab_trim(line);
+        if neg <= cols.len() {
+            perl_num(cols[cols.len() - neg])
+        } else {
+            0.0
+        }
+    };
+    let numcmp = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
+
+    lls.sort_by(|a, b| {
+        // level >= 1: a[-2] asc, then b[-1] desc.
+        let mut ord = numcmp(field(a, 2), field(b, 2));
+        if ord == std::cmp::Ordering::Equal {
+            ord = numcmp(field(b, 1), field(a, 1));
+        }
+        if level >= 2 && ord == std::cmp::Ordering::Equal {
+            ord = numcmp(field(a, 4), field(b, 4));
+            if ord == std::cmp::Ordering::Equal {
+                ord = numcmp(field(b, 3), field(a, 3));
+            }
+        }
+        if level >= 3 && ord == std::cmp::Ordering::Equal {
+            ord = numcmp(field(a, 6), field(b, 6));
+            if ord == std::cmp::Ordering::Equal {
+                ord = numcmp(field(b, 5), field(a, 5));
+            }
+        }
+        ord
+    });
+
+    let mut out = Vec::new();
+    for l in &lls {
+        out.extend_from_slice(l);
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// Output of [`dup_pe_out`]: the two filtered paired-end files.
+pub struct PeOut {
+    pub out1: Vec<u8>,
+    pub out2: Vec<u8>,
+}
+
+/// Extract an id from a FASTA/FASTQ header line the way `cd-hit-dup-PE-out.pl`
+/// does: drop the leading `>`/`@`, Perl `chop` (remove the final byte, normally
+/// the newline), then truncate at the first whitespace.
+fn pe_header_id(line: &[u8]) -> &[u8] {
+    if line.is_empty() {
+        return b"";
+    }
+    let after = &line[1..];
+    let after = if after.is_empty() {
+        after
+    } else {
+        &after[..after.len() - 1] // chop
+    };
+    let end = after
+        .iter()
+        .position(|&c| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c)
+        .unwrap_or(after.len());
+    &after[..end]
+}
+
+/// `cd-hit-dup-PE-out.pl -i R1 -j R2 -c clstr -o out1 -p out2`: export the
+/// representative paired-end reads (those whose R1 *or* R2 id is a cluster
+/// representative in the `.clstr`) into two parallel output files. Detects
+/// FASTA vs FASTQ from the first byte of `in1`.
+pub fn dup_pe_out(clstr: &[u8], in1: &[u8], in2: &[u8]) -> PeOut {
+    // Representative ids from `*` lines (Perl requires `\s(\d+)(aa|nt), >`).
+    let mut rep_ids: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    for c in parse_clstr(clstr) {
+        for m in &c.members {
+            if m.is_rep && has_len_id(&m.raw) && !m.id.is_empty() {
+                rep_ids.insert(m.id.clone());
+            }
+        }
+    }
+
+    let lines1: Vec<&[u8]> = in1.split_inclusive(|&b| b == b'\n').collect();
+    let lines2: Vec<&[u8]> = in2.split_inclusive(|&b| b == b'\n').collect();
+
+    let is_fasta = in1.first() == Some(&b'>');
+    let mut out1 = Vec::new();
+    let mut out2 = Vec::new();
+
+    let is_rep = |line: &[u8]| -> bool {
+        let ida = pe_header_id(line);
+        rep_ids.contains(ida)
+    };
+
+    if is_fasta {
+        let mut flag = false;
+        let n = lines1.len().min(lines2.len());
+        for i in 0..n {
+            let a = lines1[i];
+            let b = lines2[i];
+            if a.first() == Some(&b'>') && b.first() == Some(&b'>') {
+                flag = is_rep(a) || is_rep(b);
+            }
+            if flag {
+                out1.extend_from_slice(a);
+                out2.extend_from_slice(b);
+            }
+        }
+    } else {
+        let mut ia = 0usize;
+        let mut ib = 0usize;
+        while ia < lines1.len() && ib < lines2.len() {
+            let a = lines1[ia];
+            ia += 1;
+            let b = lines2[ib];
+            ib += 1;
+            if a.first() == Some(&b'@') && b.first() == Some(&b'@') {
+                let flag = is_rep(a) || is_rep(b);
+                if flag {
+                    out1.extend_from_slice(a);
+                    out2.extend_from_slice(b);
+                    for _ in 0..3 {
+                        if ia < lines1.len() {
+                            out1.extend_from_slice(lines1[ia]);
+                            ia += 1;
+                        }
+                    }
+                    for _ in 0..3 {
+                        if ib < lines2.len() {
+                            out2.extend_from_slice(lines2[ib]);
+                            ib += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    PeOut { out1, out2 }
+}
+
+/// `clstr_sql_tbl.pl <clstr> <tbl>`: build (or extend) a hierarchical cluster
+/// table. `existing` is `None` to create a fresh table from `clstr` (columns
+/// `id  len  cid  rep`), or `Some(table)` to append two columns (`cid  rep`) at
+/// the next clustering level — resolving each row's new cluster via its own id,
+/// or, failing that, via the representative of its last-level cluster (as in
+/// hierarchical `db90 -> db60 -> db30` runs).
+pub fn sql_tbl(clstr: &[u8], existing: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    match existing {
+        None => {
+            // Create mode: one row per member, cluster index counted from 0.
+            let mut out = Vec::new();
+            for (cid, c) in parse_clstr(clstr).iter().enumerate() {
+                for m in &c.members {
+                    if !has_len_id(&m.raw) || m.id.is_empty() {
+                        return Err(format!("format error {}", String::from_utf8_lossy(&m.raw)));
+                    }
+                    let rep = if m.is_rep { 1 } else { 0 };
+                    out.extend_from_slice(&m.id);
+                    out.extend_from_slice(format!("\t{}\t{}\t{}\n", m.len, cid, rep).as_bytes());
+                }
+            }
+            Ok(out)
+        }
+        Some(table) => {
+            // Append mode: map each id to its new-level cluster and rep flag.
+            let mut id2cid: std::collections::HashMap<Vec<u8>, i64> =
+                std::collections::HashMap::new();
+            let mut idisrep: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for (cid, c) in parse_clstr(clstr).iter().enumerate() {
+                for m in &c.members {
+                    if !has_len_id(&m.raw) || m.id.is_empty() {
+                        return Err(format!("format error {}", String::from_utf8_lossy(&m.raw)));
+                    }
+                    if m.is_rep {
+                        idisrep.insert(m.id.clone());
+                    }
+                    id2cid.insert(m.id.clone(), cid as i64);
+                }
+            }
+
+            // Table rows, newline-stripped (Perl `chop`).
+            let rows: Vec<Vec<u8>> = table
+                .split_inclusive(|&b| b == b'\n')
+                .map(|l| strip_line(l).to_vec())
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            // last_cid_2_id[last_level_cid] = the row id whose last-level rep==1.
+            let mut last_cid_2_id: std::collections::HashMap<i64, Vec<u8>> =
+                std::collections::HashMap::new();
+            for row in &rows {
+                let cols = split_tab_trim(row);
+                if cols.len() < 2 {
+                    continue;
+                }
+                let last_cid = perl_num(cols[cols.len() - 2]) as i64;
+                let last_rep = perl_num(cols[cols.len() - 1]);
+                if last_rep == 1.0 {
+                    last_cid_2_id.insert(last_cid, cols[0].to_vec());
+                }
+            }
+
+            let mut out = Vec::new();
+            for row in &rows {
+                let cols = split_tab_trim(row);
+                let id = cols.first().copied().unwrap_or(b"");
+                let last_cid = if cols.len() >= 2 {
+                    perl_num(cols[cols.len() - 2]) as i64
+                } else {
+                    0
+                };
+                let this_rep = if idisrep.contains(id) { 1 } else { 0 };
+                let this_cid = if let Some(&c) = id2cid.get(id) {
+                    c
+                } else {
+                    // Fall back to the representative of the last-level cluster.
+                    match last_cid_2_id.get(&last_cid).and_then(|r| id2cid.get(r)) {
+                        Some(&c) => c,
+                        None => return Err(format!("at {}", String::from_utf8_lossy(row))),
+                    }
+                };
+                out.extend_from_slice(row);
+                out.extend_from_slice(format!("\t{}\t{}\n", this_cid, this_rep).as_bytes());
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// One per-cluster FASTA file produced by [`make_multi_seq`]: the cluster id
+/// (used as the file name) and the file's contents.
+pub struct MultiSeqFile {
+    pub cid: Vec<u8>,
+    pub content: Vec<u8>,
+}
+
+/// The first non-whitespace token after a leading `>` (Perl `/^>(\S+)/`).
+/// Returns `None` if the line is not a `>`-header with a token.
+fn fasta_defline_id(line: &[u8]) -> Option<&[u8]> {
+    if line.first() != Some(&b'>') {
+        return None;
+    }
+    let after = &line[1..];
+    let end = after
+        .iter()
+        .position(|&c| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0b || c == 0x0c)
+        .unwrap_or(after.len());
+    if end == 0 {
+        None
+    } else {
+        Some(&after[..end])
+    }
+}
+
+/// `make_multi_seq.pl <fasta> <clstr> <out_dir> <size_cutoff>`: emit one FASTA
+/// file per cluster whose member count is `>= size_cutoff`, named by the
+/// cluster number, containing that cluster's sequences drawn from `fasta`.
+/// Files are returned in the order their clusters first appear in `fasta`
+/// (native-only: it produces many files rather than a single stream).
+pub fn make_multi_seq(
+    fasta: &[u8],
+    clstr: &[u8],
+    size_cutoff: usize,
+) -> Result<Vec<MultiSeqFile>, String> {
+    // id -> cluster number, only for clusters at or above the size cutoff.
+    let mut id2cid: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
+    for c in parse_clstr(clstr) {
+        // Header must be `>Cluster <n>`; parse_cluster_num yields -1 otherwise.
+        if c.num < 0 {
+            return Err(format!(
+                "Wrong format {}",
+                String::from_utf8_lossy(&c.header_raw)
+            ));
+        }
+        for m in &c.members {
+            if !has_len_id(&m.raw) || m.id.is_empty() {
+                return Err(format!("Wrong format {}", String::from_utf8_lossy(&m.raw)));
+            }
+        }
+        if c.size() >= size_cutoff {
+            for m in &c.members {
+                id2cid.insert(m.id.clone(), c.num);
+            }
+        }
+    }
+
+    // Stream the FASTA, routing each record to its cluster's buffer.
+    let mut order: Vec<i64> = Vec::new();
+    let mut buffers: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
+    let mut cur: Option<i64> = None;
+    let mut flag = false;
+    for line in fasta.split_inclusive(|&b| b == b'\n') {
+        if let Some(id) = fasta_defline_id(line) {
+            if let Some(&cid) = id2cid.get(id) {
+                buffers.entry(cid).or_insert_with(|| {
+                    order.push(cid);
+                    Vec::new()
+                });
+                cur = Some(cid);
+                flag = true;
+            } else {
+                flag = false;
+            }
+        }
+        if flag {
+            if let Some(cid) = cur {
+                buffers.get_mut(&cid).unwrap().extend_from_slice(line);
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|cid| MultiSeqFile {
+            cid: cid.to_string().into_bytes(),
+            content: buffers.remove(&cid).unwrap(),
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

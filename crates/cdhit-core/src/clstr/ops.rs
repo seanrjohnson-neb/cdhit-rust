@@ -1322,6 +1322,320 @@ pub fn make_multi_seq(
         .collect())
 }
 
+/// `clstr_quality_eval.pl`: sensitivity/specificity of the clustering vs a
+/// benchmark encoded in each id as `>seq_id||benchmark_id`, counting *all
+/// pairs* (unlike the link-based variant). The aggregate metrics are
+/// reproduced exactly; the three pair-listing sections are emitted in a
+/// deterministic order (sorted by sequence index) rather than Perl's
+/// hash-iteration order — the set of pairs is identical.
+pub fn quality_eval(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut seqs: Vec<Vec<u8>> = Vec::new(); // global index -> seq_id
+    let mut cdhit_clusters: Vec<Vec<usize>> = Vec::new(); // non-singleton clusters
+    let mut bench_clusters: std::collections::HashMap<Vec<u8>, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut seq_idx = 0usize;
+
+    for c in parse_clstr(input) {
+        let mut clstr_idxs: Vec<usize> = Vec::new();
+        for m in &c.members {
+            if m.id.is_empty() || !has_len_id(&m.raw) {
+                continue;
+            }
+            let parts = split_bars(&m.id);
+            let seq_id = parts.first().copied().unwrap_or(b"");
+            let ben_id = parts.get(1).copied().unwrap_or(b"");
+            if !(ben_id.is_empty() || ben_id == b"0") {
+                bench_clusters.entry(ben_id.to_vec()).or_default().push(seq_idx);
+            }
+            clstr_idxs.push(seq_idx);
+            seqs.push(seq_id.to_vec());
+            seq_idx += 1;
+        }
+        if clstr_idxs.len() > 1 {
+            cdhit_clusters.push(clstr_idxs);
+        }
+    }
+
+    // Status of each within-cluster pair: 'C' cd-hit only, 'B' benchmark only,
+    // 'T' true (both). Keyed by (lo, hi) sequence indices.
+    let mut pair_status: std::collections::HashMap<(usize, usize), u8> =
+        std::collections::HashMap::new();
+
+    let mut total_cdhit_pairs = 0i64;
+    for cluster in &cdhit_clusters {
+        let mut s = cluster.clone();
+        s.sort_unstable();
+        for i in 0..s.len() {
+            for j in i + 1..s.len() {
+                pair_status.insert((s[i], s[j]), b'C');
+                total_cdhit_pairs += 1;
+            }
+        }
+    }
+
+    let mut total_bench_pairs = 0i64;
+    let mut correct_pairs = 0i64;
+    for members in bench_clusters.values() {
+        if members.len() <= 1 {
+            continue;
+        }
+        let mut s = members.clone();
+        s.sort_unstable();
+        for i in 0..s.len() {
+            for j in i + 1..s.len() {
+                let key = (s[i], s[j]);
+                match pair_status.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        correct_pairs += 1;
+                        e.insert(b'T');
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(b'B');
+                    }
+                }
+                total_bench_pairs += 1;
+            }
+        }
+    }
+
+    if total_bench_pairs == 0 || total_cdhit_pairs == 0 {
+        return Err("Illegal division by zero".to_string());
+    }
+    let sen = correct_pairs as f64 / total_bench_pairs as f64;
+    let spe = correct_pairs as f64 / total_cdhit_pairs as f64;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("Total benchmark pairs\t{}\n", total_bench_pairs).as_bytes());
+    out.extend_from_slice(format!("Total cd-hit pairs\t{}\n", total_cdhit_pairs).as_bytes());
+    out.extend_from_slice(format!("Total correct pairs\t{}\n", correct_pairs).as_bytes());
+    out.extend_from_slice(format!("Sensitivity\t{}\n", perl_g(sen)).as_bytes());
+    out.extend_from_slice(format!("Specificity\t {}\n", perl_g(spe)).as_bytes());
+
+    // Deterministic pair listings (sorted by index pair).
+    let listing = |out: &mut Vec<u8>, header: &str, want: u8| {
+        out.extend_from_slice(format!("\n\n{}\n", header).as_bytes());
+        let mut pairs: Vec<(usize, usize)> = pair_status
+            .iter()
+            .filter(|(_, &st)| st == want)
+            .map(|(&k, _)| k)
+            .collect();
+        pairs.sort_unstable();
+        for (i, j) in pairs {
+            out.extend_from_slice(&seqs[i]);
+            out.push(b'\t');
+            out.extend_from_slice(&seqs[j]);
+            out.push(b'\n');
+        }
+    };
+    listing(&mut out, "Pairs in benchmark but not in cd-hit", b'B');
+    listing(&mut out, "Pairs in cd-hit but not in benchmark", b'C');
+    listing(&mut out, "Pairs in both cd-hit and benchmark", b'T');
+    Ok(out)
+}
+
+/// (rep_id, level) -> (member count including the rep, non-rep member ids).
+type ChildMap = std::collections::HashMap<(Vec<u8>, i64), (i64, Vec<Vec<u8>>)>;
+
+/// Hierarchical-cluster model built by [`to_xml`] from one or more `.clstr`
+/// levels (finest first, coarsest last — the ARGV order of `clstr2xml.pl`).
+struct XmlModel {
+    n: i64,
+    option: String,
+    childofgi: ChildMap,
+    /// (id, level) -> the id's representative at that level.
+    parent: std::collections::HashMap<(Vec<u8>, i64), Vec<u8>>,
+    /// (rep_id, level) -> cumulative sequence count (propagated up the tree).
+    size: std::collections::HashMap<(Vec<u8>, i64), i64>,
+    /// id -> length.
+    len: std::collections::HashMap<Vec<u8>, i64>,
+    /// (id, level) -> identity string (e.g. `96.79%`) for non-rep members.
+    identity: std::collections::HashMap<(Vec<u8>, i64), Vec<u8>>,
+}
+
+impl XmlModel {
+    fn len_of(&self, id: &[u8]) -> i64 {
+        self.len.get(id).copied().unwrap_or(0)
+    }
+
+    /// Emit one `<representativeMember>` subtree (mirrors Perl's `printnode`).
+    fn print_node(&self, out: &mut Vec<u8>, key: &[u8], level: i64) {
+        let ckey = (key.to_vec(), level);
+        let (this_no, members) = match self.childofgi.get(&ckey) {
+            Some(v) => v,
+            None => return,
+        };
+        let space = " ".repeat((3 * (self.n - level)).max(0) as usize);
+        let mspace = format!("{space}   ");
+
+        out.extend_from_slice(space.as_bytes());
+        out.extend_from_slice(b"<representativeMember ");
+        out.extend_from_slice(format!("Level=\"{level}\" ").as_bytes());
+        if level > 1 {
+            out.extend_from_slice(format!("GroupNo=\"{this_no}\" ").as_bytes());
+        }
+        let sz = self.size.get(&ckey).copied().unwrap_or(0);
+        out.extend_from_slice(
+            format!("SequenceNo=\"{sz}\" Length=\"{}\"", self.len_of(key)).as_bytes(),
+        );
+        // Identity comes from the level above (the parent's cluster).
+        if let Some(idn) = self.identity.get(&(key.to_vec(), level + 1)) {
+            out.extend_from_slice(b" Identity=\"");
+            out.extend_from_slice(idn);
+            out.extend_from_slice(b"\"");
+        } else if level < self.n {
+            out.extend_from_slice(b" Identity=\"100%\"");
+        }
+        out.extend_from_slice(b">");
+        out.extend_from_slice(key);
+        out.push(b'\n');
+
+        // ids = [rep] + non-rep members, sorted per the chosen option.
+        let mut ids: Vec<Vec<u8>> = Vec::with_capacity(members.len() + 1);
+        ids.push(key.to_vec());
+        ids.extend(members.iter().cloned());
+        let nextlevel = level - 1;
+        if self.option == "-len" || nextlevel == 0 {
+            ids.sort_by(|a, b| {
+                self.len_of(b).cmp(&self.len_of(a)).then_with(|| a.cmp(b))
+            });
+        } else if self.option == "-size" {
+            ids.sort_by(|a, b| {
+                let sb = self.size.get(&(b.clone(), nextlevel)).copied().unwrap_or(0);
+                let sa = self.size.get(&(a.clone(), nextlevel)).copied().unwrap_or(0);
+                sb.cmp(&sa).then_with(|| a.cmp(b))
+            });
+        }
+
+        for id in ids.iter().take(*this_no as usize) {
+            if self.childofgi.contains_key(&(id.clone(), nextlevel)) {
+                self.print_node(out, id, nextlevel);
+            } else {
+                out.extend_from_slice(mspace.as_bytes());
+                out.extend_from_slice(
+                    format!("<member Length=\"{}\"", self.len_of(id)).as_bytes(),
+                );
+                if let Some(idn) = self.identity.get(&(id.clone(), level)) {
+                    out.extend_from_slice(b" Identity=\"");
+                    out.extend_from_slice(idn);
+                    out.extend_from_slice(b"\"");
+                } else if level < self.n || self.n == 1 {
+                    out.extend_from_slice(b" Identity=\"100%\"");
+                }
+                out.extend_from_slice(b">");
+                out.extend_from_slice(id);
+                out.extend_from_slice(b"</member>\n");
+            }
+        }
+        out.extend_from_slice(space.as_bytes());
+        out.extend_from_slice(b"</representativeMember>\n");
+    }
+}
+
+/// `clstr2xml.pl [-len|-size] level1.clstr [level2.clstr ...]`: build a nested
+/// XML view of a hierarchical clustering. `files` are the `.clstr` levels in
+/// ARGV order (finest first; the last is the top level). Node and member
+/// ordering follows `option` (`-len` by length, `-size` by cluster size), with
+/// a deterministic id tiebreak in place of Perl's hash order.
+pub fn to_xml(option: &str, files: &[&[u8]]) -> Vec<u8> {
+    let n = files.len() as i64;
+    let mut m = XmlModel {
+        n,
+        option: option.to_string(),
+        childofgi: std::collections::HashMap::new(),
+        parent: std::collections::HashMap::new(),
+        size: std::collections::HashMap::new(),
+        len: std::collections::HashMap::new(),
+        identity: std::collections::HashMap::new(),
+    };
+    let mut topsize = 0i64;
+    let mut totalsequence = 0i64;
+
+    // Process levels from the top (n) down to 1, as the Perl does.
+    for ilevel in (1..=n).rev() {
+        let clusters = parse_clstr(files[(ilevel - 1) as usize]);
+        if ilevel == n {
+            topsize += clusters.len() as i64;
+        }
+        for c in &clusters {
+            let mut key: Option<Vec<u8>> = None;
+            let mut members: Vec<Vec<u8>> = Vec::new();
+            let mut this_no = 0i64;
+            for mem in &c.members {
+                if mem.id.is_empty() || !has_len_id(&mem.raw) {
+                    continue;
+                }
+                m.len.insert(mem.id.clone(), mem.len);
+                if mem.is_rep {
+                    key = Some(mem.id.clone());
+                } else {
+                    members.push(mem.id.clone());
+                    if !mem.iden.is_empty() {
+                        m.identity.insert((mem.id.clone(), ilevel), mem.iden.clone());
+                    }
+                }
+                this_no += 1;
+            }
+            let key = match key {
+                Some(k) if this_no > 0 => k,
+                _ => continue, // Perl requires a representative and >0 members.
+            };
+
+            let nextlevel = ilevel - 1;
+            m.childofgi
+                .insert((key.clone(), ilevel), (this_no, members.clone()));
+            if ilevel > 1 {
+                for k in &members {
+                    m.parent.insert((k.clone(), nextlevel), key.clone());
+                }
+                m.parent.insert((key.clone(), nextlevel), key.clone());
+            }
+            m.size.insert((key.clone(), ilevel), this_no);
+            totalsequence += this_no;
+            if ilevel < n {
+                totalsequence -= 1;
+                let mut j = ilevel;
+                let mut kk = key.clone();
+                while let Some(p) = m.parent.get(&(kk.clone(), j)).cloned() {
+                    kk = p;
+                    j += 1;
+                    *m.size.entry((kk.clone(), j)).or_insert(0) += this_no - 1;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n");
+    out.extend_from_slice(
+        format!(
+            "<CDHIT_Clusters GroupNo=\"{topsize}\" SequenceNo=\"{totalsequence}\" xmlns=\"weizhong-lab.ucsd.edu\">\n"
+        )
+        .as_bytes(),
+    );
+
+    // Top-level (level n) clusters, ordered by the chosen option.
+    let mut topkeys: Vec<Vec<u8>> = m
+        .childofgi
+        .keys()
+        .filter(|(_, lv)| *lv == n)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if option == "-len" {
+        topkeys.sort_by(|a, b| m.len_of(b).cmp(&m.len_of(a)).then_with(|| a.cmp(b)));
+    } else if option == "-size" {
+        topkeys.sort_by(|a, b| {
+            let sb = m.size.get(&(b.clone(), n)).copied().unwrap_or(0);
+            let sa = m.size.get(&(a.clone(), n)).copied().unwrap_or(0);
+            sb.cmp(&sa).then_with(|| a.cmp(b))
+        });
+    }
+    for k in &topkeys {
+        m.print_node(&mut out, k, n);
+    }
+    out.extend_from_slice(b"</CDHIT_Clusters>\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

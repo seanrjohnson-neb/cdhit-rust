@@ -212,6 +212,40 @@ fn clstr_sql_tbl_append_matches_perl() {
 }
 
 #[test]
+fn clstr_quality_eval_matches_perl_content() {
+    // Aggregate metrics are byte-identical to Perl; the pair listings are the
+    // same set of pairs, emitted in a deterministic (sorted) order. The golden
+    // was captured from that deterministic output and verified against Perl.
+    let bench = include_bytes!("data/clstr/bench.clstr");
+    assert_eq!(
+        ops::quality_eval(bench).unwrap(),
+        include_bytes!("data/clstr/qual_eval.out")
+    );
+}
+
+#[test]
+fn clstr2xml_single_level_matches_perl() {
+    // Distinct lengths => Perl's own output is deterministic, so this is a
+    // byte-for-byte golden.
+    let c = include_bytes!("data/clstr/xml1.clstr");
+    assert_eq!(ops::to_xml("-len", &[c]), include_bytes!("data/clstr/xml1_len.out"));
+}
+
+#[test]
+fn clstr2xml_two_level_matches_perl() {
+    let fine = include_bytes!("data/clstr/xml_fine.clstr");
+    let coarse = include_bytes!("data/clstr/xml_coarse.clstr");
+    assert_eq!(
+        ops::to_xml("-len", &[fine, coarse]),
+        include_bytes!("data/clstr/xml_2level_len.out")
+    );
+    assert_eq!(
+        ops::to_xml("-size", &[fine, coarse]),
+        include_bytes!("data/clstr/xml_2level_size.out")
+    );
+}
+
+#[test]
 fn make_multi_seq_matches_perl() {
     let fasta = include_bytes!("data/clstr/multiseq.faa");
     let files = ops::make_multi_seq(fasta, PROT, 3).unwrap();

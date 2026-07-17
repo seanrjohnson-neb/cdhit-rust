@@ -27,7 +27,9 @@ differential testing:
 | `read-linker` | Join paired-end reads by 3'/5' overlap |
 
 Many of the Perl `.clstr` post-processing scripts are also ported, as `cdhit
-<name>` subcommands, each verified byte-identical to the reference Perl:
+<name>` subcommands, each verified byte-identical to the reference Perl (except
+the two marked †, which emit the same data in a deterministic order in place of
+Perl's hash-iteration order — see the note below the table):
 
 | Subcommand | Perl script | Description |
 |---|---|---|
@@ -49,21 +51,30 @@ Many of the Perl `.clstr` post-processing scripts are also ported, as `cdhit
 | `clstr_select_rep` | `clstr_select_rep.pl` | Print representatives of clusters within a size range |
 | `clstr_sort_prot_by` | `clstr_sort_prot_by.pl` | Sort members within each cluster by length or id |
 | `clstr_quality_eval_by_link` | `clstr_quality_eval_by_link.pl` | Sensitivity/specificity vs a benchmark (independent links) |
+| `clstr_quality_eval` † | `clstr_quality_eval.pl` | Sensitivity/specificity vs a benchmark (all pairs, with pair listings) |
 | `plot_len1` | `plot_len1.pl` | Tabular sequence/cluster counts by size × representative-length bins |
 | `clstr_sql_tbl` | `clstr_sql_tbl.pl` | Build/extend a hierarchical cluster table (`id len cid rep`, two columns per level) |
 | `clstr_sql_tbl_sort` | `clstr_sql_tbl_sort.pl` | Stable-sort a cluster SQL table by hierarchy columns |
+| `clstr2xml` † | `clstr2xml.pl` | Nested XML view of a (possibly hierarchical) clustering |
 | `make_multi_seq` | `make_multi_seq.pl` | Write one FASTA file per cluster above a size cutoff |
 | `cd-hit-dup-PE-out` | `cd-hit-dup-PE-out.pl` | Export representative paired-end reads after `cd-hit-dup` |
 
+† `clstr_quality_eval` and `clstr2xml`: the reference Perl emits its pair lists /
+sibling nodes in Perl hash-iteration order, which is not reproducible. The port
+emits the **same data** (identical aggregate metrics, identical set of
+pairs/nodes and attributes) in a **deterministic** order — pairs sorted by
+sequence index, XML siblings by length or cluster size (`-len`/`-size`) with an
+id tiebreak. Output is therefore byte-identical to Perl whenever the sort keys
+are unique.
+
 Not ported: `psi-cd-hit` (orchestrates external BLAST/PSI-BLAST — not
 WASM-relevant) and the `cd-hit-para.pl` / `cd-hit-2d-para.pl` grid wrappers
-(superseded by the `-T` rayon parallelism). Some Perl scripts are intentionally
-**not** ported because they cannot be made bit-for-bit reproducible or need
-non-portable dependencies: `FET.pl` (external CPAN `Text::NSP` module + Perl
-`Storable` + hash-ordered output), `clstr_quality_eval.pl` and `clstr2xml.pl`
-(emit in Perl hash-iteration order), `clstr_list.pl` (Perl `Storable` binary
-format), and `plot_2d.pl` (ImageMagick / non-deterministic drawing). See
-[Remaining Perl scripts](#remaining-perl-scripts) for the full breakdown.
+(superseded by the `-T` rayon parallelism). A few Perl scripts are intentionally
+**not** ported because they need non-portable dependencies or binary formats:
+`FET.pl` (external CPAN `Text::NSP` module + Perl `Storable`), `clstr_list.pl`
+(Perl `Storable` binary format), and `plot_2d.pl` (ImageMagick / non-deterministic
+drawing). See [Remaining Perl scripts](#remaining-perl-scripts) for the full
+breakdown.
 
 The `cd-hit-auxtools` programs work on FASTA/FASTQ, share the `cdhit-core`
 crate, and — like the clustering programs — build for WebAssembly.
@@ -103,6 +114,8 @@ cargo build --release
 ./target/release/cdhit clstr2txt out.clstr > table.tsv
 ./target/release/cdhit clstr_select_rep 2 100 out.clstr > reps.txt
 ./target/release/cdhit plot_len1 out.clstr 1,2-5,6-up 1-100,101-200,201-up
+./target/release/cdhit clstr_quality_eval out.clstr        # ids as >seq||benchmark
+./target/release/cdhit clstr2xml -len nr90.clstr nr80.clstr > tree.xml
 
 # cd-hit-dup-PE-out uses getopts-style flags and writes two files
 ./target/release/cdhit cd-hit-dup-PE-out -i R1.fq -j R2.fq -c uniq.clstr \
@@ -231,20 +244,19 @@ table above), each verified byte-identical to the reference Perl:
 `cd-hit-dup-PE-out`, `clstr_quality_eval_by_link`, `plot_len1`, and
 `clstr_sql_tbl_sort`.
 
-Two more native-only helpers have since been ported (also byte-identical):
-`make_multi_seq` (one FASTA per cluster) and `clstr_sql_tbl` (the table producer
-that `clstr_sql_tbl_sort` consumes).
+Since then the two native-only helpers `make_multi_seq` and `clstr_sql_tbl`
+(also byte-identical), plus `clstr_quality_eval` and `clstr2xml` (byte-identical
+except for the hash-order → deterministic-order change described above), have
+also been ported.
 
-The following scripts remain unported. The first group is portable but each
-carries a caveat; the second group is out of scope for the Windows/WASM story.
+The only remaining portable script is `cd-hit-div.pl`; everything else is out of
+scope for the Windows/WASM story.
 
-**Useful, but with caveats**
+**Low priority**
 
 | Script | Feasibility | Notes |
 |---|---|---|
 | `cd-hit-div.pl` | High | Round-robin split without sorting; differs from the ported `cd-hit-div`. Mainly historical wrapper compatibility. |
-| `clstr_quality_eval.pl` | Medium | Aggregate metrics are easy, but the pair-list sections iterate Perl hashes, so byte-identical output is not stable (only the link-based variant is ported). |
-| `clstr2xml.pl` | Medium | Output order depends on Perl hash iteration; a deterministic XML writer would be better than byte-parity. |
 
 **Out of scope**
 

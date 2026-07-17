@@ -1,0 +1,32 @@
+Total benchmark pairs	12
+Total cd-hit pairs	10
+Total correct pairs	4
+Sensitivity	0.333333333333333
+Specificity	 0.4
+
+
+Pairs in benchmark but not in cd-hit
+s1	s9
+s2	s9
+s3	s5
+s3	s6
+s3	s10
+s4	s9
+s5	s10
+s6	s10
+
+
+Pairs in cd-hit but not in benchmark
+s1	s3
+s2	s3
+s3	s4
+s5	s7
+s6	s7
+s9	s10
+
+
+Pairs in both cd-hit and benchmark
+s1	s2
+s1	s4
+s2	s4
+s5	s6

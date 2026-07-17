@@ -58,7 +58,8 @@ fn usage() -> ! {
          \x20 clstr2txt, clstr_renumber, clstr_select, clstr_select_rep, clstr_cut,\n\
          \x20 clstr_rep, clstr2tree, cd-hit-clstr_2_blm8, clstr_reduce, clstr_rev,\n\
          \x20 clstr_merge, clstr_merge_noorder, clstr_reps_faa_rev, plot_len1,\n\
-         \x20 clstr_quality_eval_by_link, clstr_sql_tbl_sort.\n\
+         \x20 clstr_quality_eval_by_link, clstr_quality_eval, clstr2xml,\n\
+         \x20 clstr_sql_tbl_sort.\n\
          \n\
          .clstr post-processing that writes files (native only):\n\
          \x20 clstr_sql_tbl <clstr> <tbl>, make_multi_seq <fasta> <clstr> <dir> [size],\n\
@@ -692,6 +693,36 @@ fn try_run_clstr(name: &str, args: &[String]) -> bool {
                     exit(1);
                 }
             }
+        }
+        "clstr_quality_eval" | "clstr-quality-eval" => {
+            let input = read_clstr_input(args.first().map(|s| s.as_str()));
+            match clstr_ops::quality_eval(&input) {
+                Ok(o) => {
+                    stdout.write_all(&o).ok();
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
+        "clstr2xml" | "clstr2xml.pl" => {
+            // clstr2xml.pl [-len|-size] input1.clstr [input2.clstr ...]
+            let mut option = "-len";
+            let mut rest: &[String] = args;
+            if let Some(first) = args.first() {
+                if first.starts_with('-') {
+                    option = first;
+                    rest = &args[1..];
+                }
+            }
+            if rest.is_empty() {
+                print!("Usage:\n\tclstr2xml.pl [-len|-size] input1.clstr [input2.clstr input3.clstr ...]\n");
+                exit(0);
+            }
+            let files: Vec<Vec<u8>> = rest.iter().map(|p| read_clstr_input(Some(p))).collect();
+            let refs: Vec<&[u8]> = files.iter().map(|f| f.as_slice()).collect();
+            stdout.write_all(&clstr_ops::to_xml(option, &refs)).ok();
         }
         "make_multi_seq" | "make_multi_seq.pl" => {
             // make_multi_seq.pl <fasta> <clstr> <out_dir> <size_cutoff>

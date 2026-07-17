@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<CDHIT_Clusters GroupNo="2" SequenceNo="4" xmlns="weizhong-lab.ucsd.edu">
+<representativeMember Level="1" SequenceNo="3" Length="100">s1
+   <member Length="100" Identity="100%">s1</member>
+   <member Length="90" Identity="95.00%">s2</member>
+   <member Length="80" Identity="90.00%">s3</member>
+</representativeMember>
+<representativeMember Level="1" SequenceNo="1" Length="70">s4
+   <member Length="70" Identity="100%">s4</member>
+</representativeMember>
+</CDHIT_Clusters>

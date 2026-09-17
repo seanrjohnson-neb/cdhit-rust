@@ -10,6 +10,13 @@ representative FASTA are byte-identical to the reference C++ (`make openmp=no`).
 
 The port was done almost entirely by Claude 4.8. Bug reports and pull requests welcome.
 
+## Citation
+
+Please cite the original CD-Hit paper
+
+Fu, L., Niu, B., Zhu, Z., Wu, S., & Li, W. (2012). CD-HIT: Accelerated for clustering the next-generation sequencing data. Bioinformatics, 28(23), 3150–3152. [https://doi.org/10.1093/bioinformatics/bts565](https://doi.org/10.1093/bioinformatics/bts565)
+
+
 ## Status
 
 All six clustering programs plus the three `cd-hit-auxtools` programs are

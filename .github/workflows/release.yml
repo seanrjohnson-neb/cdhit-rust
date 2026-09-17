@@ -1,0 +1,99 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to upload the binaries to (leave empty to only keep them as workflow artifacts)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc -vV
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cdhit-cli
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event.release.tag_name || inputs.tag }}"
+          if [ -z "$version" ]; then
+            version="$(git rev-parse --short HEAD)"
+          fi
+          name="cdhit-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp README.md LICENSE "dist/${name}/"
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/cdhit.exe" "dist/${name}/"
+            (cd dist && 7z a -tzip "${name}.zip" "${name}" >/dev/null)
+            asset="dist/${name}.zip"
+          else
+            cp "target/${{ matrix.target }}/release/cdhit" "dist/${name}/"
+            strip "dist/${name}/cdhit" || true
+            tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+            asset="dist/${name}.tar.gz"
+          fi
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -uo pipefail
+          bin="target/${{ matrix.target }}/release/cdhit"
+          if [ "${{ matrix.archive }}" = "zip" ]; then bin="${bin}.exe"; fi
+          # The CLI prints its usage banner and exits 1 when given no program.
+          out="$("$bin" 2>&1 || true)"
+          echo "$out" | head -n 5
+          echo "$out" | grep -q "Usage: cdhit"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release' || inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name || inputs.tag }}" "${{ steps.package.outputs.asset }}" --clobber
